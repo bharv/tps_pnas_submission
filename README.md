@@ -2,11 +2,11 @@
 
 Analysis code for the Tidal Parr Survey (TPS) and Enhanced Delta Smelt Monitoring (EDSM)
 juvenile Chinook salmon analysis submitted to *PNAS*. It covers data preparation, every reported
-Bayesian model set, the model diagnostics, and the code that draws the final figures. The
-salinity / temperature / water-year appendix is kept separate.
+Bayesian model set, the model diagnostics, and the code that draws the final figures. Also covered is the code for the
+salinity / temperature / water-year analysis appendix.
 
 **This repository holds code only.** Survey data, fitted models (several GB of `.rds`), caches and
-rendered figures are not included. Data that the analysis took from public web services can be
+rendered figures are not included. All data needed for analysis and figure building is available from public web services and can be
 re-downloaded with `00_data/00_download_web_data.R`.
 
 ---
