@@ -103,7 +103,7 @@ download_cdec_timeseries <- function(start = "2016-10-01", end = "2021-07-15") {
 # (1b) CDEC conductance stations for the appendix salinity contour maps.
 #      The Suisun Marsh interior stations (BDL, MSL, GYS, CYG, TEA, IBS, FLT, GZS,
 #      GZM) are downloaded for completeness but EXCLUDED from the interpolation in
-#      appendix A10 (they sit behind the Suisun Marsh Salinity Control Gates).
+#      appendix A09 (they sit behind the Suisun Marsh Salinity Control Gates).
 # -----------------------------------------------------------------------------
 download_cdec_salinity_field <- function(start = "2016-10-15", end = "2021-07-05") {
   specs <- c("MRZ:100:D", "PCT:100:D", "MAL:100:D", "CLL:100:D", "BDL:324:D",
