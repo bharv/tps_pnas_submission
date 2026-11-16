@@ -1,0 +1,371 @@
+---
+title: "Habitat maps: edge type and water body"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 05 — maps.**
+>
+> **Purpose.** The edge-type map (one panel per TPS edge class) and the TPS/EDSM water-body map,
+> drawn on a TIGERweb vector water basemap (downloaded and cached on first run; see also
+> `00_data/00_download_web_data.R`).
+>
+> **Inputs.** `data/tow_12_6_tps_wq_nona.csv`, `data/tow_12_6_edsm_wq_nona.csv`,
+> `data/All_Surveys_Combined_v7.3.csv` (Rip Rap reference tows only),
+> `data/spatial/delta_hydro_tiger.rds`.
+> **Outputs.** `output_figs/TPS_edge_type_map.*`, `output_figs/TPS_EDSM_waterbody_map.*`.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+Two journal-format figures built from the modelled tow data
+(`data/tow_12_6_tps_wq_nona.csv`, `data/tow_12_6_edsm_wq_nona.csv`):
+
+* **`TPS_edge_type_map.*`** — 174 mm wide, six faceted panels (one per edge type),
+  8 pt type throughout, in-panel corner labels, hairline black dividers.
+* **`TPS_EDSM_waterbody_map.*`** — 84 mm wide, TPS over EDSM, shared extent,
+  single shared legend inside the bottom panel.
+
+Both are sized so the panels fill the stated width exactly: the figure height is
+derived from the map's own aspect ratio, so there are no white letterbox bands
+on the sides.
+
+Rip Rap tows come from `data/All_Surveys_Combined_v7.3.csv` rather than the model
+data — all 8 were dropped when the modelling dataset was built (none of their
+station codes or coordinates appear in `tow_12_6_tps_wq_nona.csv`). They are
+mapped in the last panel for reference only; note this in the figure caption.
+
+The basemap is vector (TIGER/Line areal hydrography: white water on grey land)
+rather than a raster tile service — CARTO's keyless tiles are now watermarked,
+and a vector basemap is reproducible offline and carries no tile-attribution
+requirement for publication. It is downloaded once and cached to `data/spatial/`.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(patchwork)
+
+dir.create("output_figs",  showWarnings = FALSE)
+dir.create("data/spatial", showWarnings = FALSE, recursive = TRUE)
+
+BASE_PT <- 8                 # every piece of text in both figures
+PT_MM   <- BASE_PT / .pt     # same size expressed for geom_label()
+```
+
+```{r basemap, message=FALSE, warning=FALSE}
+# TIGERweb areal hydrography for the Suisun Bay / west Delta study area.
+# Downloaded once, then read from the local cache.
+HYDRO_RDS <- "data/spatial/delta_hydro_tiger.rds"
+BBOX      <- c(xmin = -122.60, ymin = 37.92, xmax = -121.68, ymax = 38.32)
+
+if (!file.exists(HYDRO_RDS)) {
+  url <- paste0(
+    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Hydro/",
+    "MapServer/1/query?",
+    "geometry=", paste(BBOX[c("xmin", "ymin", "xmax", "ymax")], collapse = ","),
+    "&geometryType=esriGeometryEnvelope&inSR=4326&outSR=4326",
+    "&spatialRel=esriSpatialRelIntersects&where=1%3D1&outFields=NAME",
+    "&returnGeometry=true&f=geojson"
+  )
+  tmp <- tempfile(fileext = ".geojson")
+  utils::download.file(url, tmp, quiet = TRUE)
+  h <- sf::st_make_valid(sf::st_read(tmp, quiet = TRUE))
+  h <- suppressWarnings(sf::st_crop(h, BBOX))
+  h <- sf::st_geometry(h)          # geometry only; attributes unused
+  saveRDS(h, HYDRO_RDS)
+}
+hydro <- readRDS(HYDRO_RDS)
+
+LAND_FILL  <- "#dcdcdc"   # cartolight-like grey land
+WATER_FILL <- "#ffffff"
+
+# Water drawn with no stroke: TIGER splits polygons at county lines, and an
+# outline would show those seams as spurious lines across San Pablo Bay.
+basemap_layer <- function() geom_sf(data = hydro, fill = WATER_FILL, colour = NA)
+```
+
+```{r palette}
+# Okabe-Ito / CUD palette, as specified.
+pal <- c(
+  "Shoal"                = "#0072B2",   # water body AND edge level share this colour
+  "Distributary Channel" = "#56B4E9",
+  "Terminal Channel"     = "#CC79A7",
+  "Natural Edge"         = "#000000",
+  "Emergent Vegetation"  = "#009E73",
+  "Earthen Levee"        = "#D55E00",
+  "Cut Bank"             = "#F0E442",
+  "Rip Rap"              = "#E69F00"
+)
+
+darken <- function(hex, f = 0.55) {
+  m <- col2rgb(hex) * f
+  rgb(m[1, ], m[2, ], m[3, ], maxColorValue = 255)
+}
+pal_stroke <- setNames(darken(pal), names(pal))
+pal_stroke["Cut Bank"] <- "#8a7a00"   # pale yellow needs a stronger edge on white water
+```
+
+```{r load, message=FALSE}
+recode_wb <- function(x) recode(x,
+  "Shoal"        = "Shoal",
+  "Distributary" = "Distributary Channel",
+  "Terminal"     = "Terminal Channel")
+
+tps <- read_csv("data/tow_12_6_tps_wq_nona.csv", show_col_types = FALSE) %>%
+  mutate(waterbody = recode_wb(habitat2020),
+         edge = recode(Edge_Type,
+                       "Open Shoal"          = "Shoal",
+                       "Emergent Vegitation" = "Emergent Vegetation"))
+
+edsm <- read_csv("data/tow_12_6_edsm_wq_nona.csv", show_col_types = FALSE) %>%
+  mutate(waterbody = recode_wb(habitat2020))
+
+# Rip Rap: not in the model dataset, pulled from the full survey compilation.
+riprap <- read_csv("data/All_Surveys_Combined_v7.3.csv",
+                   show_col_types = FALSE, guess_max = 50000) %>%
+  filter(Survey == "TPS", Edge_Type == "Riprap") %>%
+  transmute(Station_Latitude, Station_Longitude, edge = "Rip Rap") %>%
+  distinct()
+
+stopifnot(!any(paste(riprap$Station_Latitude, riprap$Station_Longitude) %in%
+               paste(tps$Station_Latitude, tps$Station_Longitude)))
+
+as_pts <- function(d) st_as_sf(d, coords = c("Station_Longitude", "Station_Latitude"),
+                               crs = 4326)
+
+# One marker per sampled location. TPS StationCode is unique per tow-year, so
+# every row is its own site; EDSM revisits stations, so collapse to unique sites.
+tps_edge_sf <- tps %>%
+  select(Station_Latitude, Station_Longitude, edge) %>%
+  bind_rows(riprap) %>%
+  as_pts()
+
+tps_wb_sf <- tps %>%
+  distinct(Station_Latitude, Station_Longitude, waterbody) %>%
+  as_pts()
+
+edsm_wb_sf <- edsm %>%
+  distinct(StationCode, Station_Latitude, Station_Longitude, waterbody) %>%
+  as_pts()
+
+count(st_drop_geometry(tps_edge_sf), edge,      sort = TRUE)
+count(st_drop_geometry(tps_wb_sf),   waterbody, sort = TRUE)
+count(st_drop_geometry(edsm_wb_sf),  waterbody, sort = TRUE)
+```
+
+```{r geometry-helpers}
+extent_of <- function(..., pad_x = 0.015, pad_y = 0.015) {
+  bbs <- lapply(list(...), st_bbox)
+  list(xlim = c(min(sapply(bbs, `[[`, "xmin")) - pad_x,
+                max(sapply(bbs, `[[`, "xmax")) + pad_x),
+       ylim = c(min(sapply(bbs, `[[`, "ymin")) - pad_y,
+                max(sapply(bbs, `[[`, "ymax")) + pad_y))
+}
+
+# Panel height / panel width that coord_sf will enforce for a lon/lat extent.
+# Used to derive the figure height so panels fill the requested width exactly.
+map_aspect <- function(ext) {
+  diff(ext$ylim) / (diff(ext$xlim) * cos(mean(ext$ylim) * pi / 180))
+}
+
+# Label pinned inside the upper-left corner of the panel, on an opaque white
+# plate so it stays legible over water, land or markers.
+corner_label <- function(ext, txt, inset_x = 0.006, inset_y = 0.012) {
+  annotate("label",
+           x = ext$xlim[1] + inset_x * diff(ext$xlim),
+           y = ext$ylim[2] - inset_y * diff(ext$ylim),
+           label = txt, hjust = 0, vjust = 1,
+           size = PT_MM, fontface = "bold", colour = "black",
+           fill = "white", border.colour = NA,
+           label.padding = unit(1.2, "pt"), label.r = unit(0, "pt"))
+}
+
+# Hairline black frame; with zero plot margins, adjacent frames abut and read as
+# a single thin divider between panels.
+DIVIDER <- element_rect(colour = "black", fill = NA, linewidth = 0.25)
+
+panel_theme <- function() {
+  theme_void(base_size = BASE_PT) +
+    theme(
+      text             = element_text(size = BASE_PT),
+      panel.background = element_rect(fill = LAND_FILL, colour = NA),
+      panel.border     = DIVIDER,
+      plot.margin      = margin(0, 0, 0, 0),
+      plot.background  = element_blank()
+    )
+}
+```
+
+## Edge type — six panels, 174 mm
+
+```{r edge-facets, message=FALSE, warning=FALSE}
+W_EDGE   <- 174 / 25.4      # mm -> in
+NCOL     <- 2
+NROW     <- 3
+
+ext_edge <- extent_of(tps_edge_sf)
+H_EDGE   <- W_EDGE * map_aspect(ext_edge) * NROW / NCOL
+
+edge_levels <- c("Natural Edge", "Emergent Vegetation", "Cut Bank",
+                 "Earthen Levee", "Shoal", "Rip Rap")
+
+# Context = the model tow locations, so the Rip Rap panel still shows where the
+# rest of the survey went without adding non-model points to the other panels.
+context_sf <- tps_edge_sf[tps_edge_sf$edge != "Rip Rap", ]
+
+edge_panel <- function(lev) {
+  d <- tps_edge_sf[tps_edge_sf$edge == lev, ]
+  # Rip Rap is not a model level -- a black cross separates it at a glance from
+  # the filled circles used for the five modelled edge types.
+  marker <- if (lev == "Rip Rap") {
+    geom_sf(data = d, shape = 4, colour = "black", size = 1.7, stroke = 0.6)
+  } else {
+    geom_sf(data = d, shape = 21, fill = pal[[lev]], colour = pal_stroke[[lev]],
+            size = 1.4, stroke = 0.26)
+  }
+  ggplot() +
+    basemap_layer() +
+    geom_sf(data = context_sf, colour = "grey76", size = 0.25, shape = 16) +
+    marker +
+    corner_label(ext_edge, sprintf("%s (n = %d)", lev, nrow(d))) +
+    coord_sf(xlim = ext_edge$xlim, ylim = ext_edge$ylim, expand = FALSE, crs = 4326) +
+    panel_theme()
+}
+
+# plot_annotation() zeroes patchwork's own 5.5 pt outer margin, which would
+# otherwise inset the whole assembly and reintroduce white edges.
+NO_MARGIN <- plot_annotation(theme = theme(plot.margin = margin(0, 0, 0, 0)))
+
+p_edge <- wrap_plots(lapply(edge_levels, edge_panel), ncol = NCOL) + NO_MARGIN
+print(p_edge)
+
+ggsave("output_figs/TPS_edge_type_map.pdf",  p_edge, width = W_EDGE, height = H_EDGE)
+ggsave("output_figs/TPS_edge_type_map.tiff", p_edge, width = W_EDGE, height = H_EDGE,
+       dpi = 600, compression = "lzw")
+ggsave("output_figs/TPS_edge_type_map_preview.png", p_edge,
+       width = W_EDGE, height = H_EDGE, dpi = 320)
+
+cat(sprintf("edge figure: %.1f x %.1f mm\n", W_EDGE * 25.4, H_EDGE * 25.4))
+```
+
+## Water body type — TPS over EDSM, 84 mm
+
+Each panel carries its own legend with its own `n`, so the counts are
+unambiguous. Both panels share one extent, extended south by `LEG_CLEAR` mm so
+each legend sits below the southernmost point rather than over it. The legend
+width was measured off the built grob (`guide-box-inside`) rather than guessed:
+the full `Name (n = ###)` form is 80.7 mm for TPS and 77.5 mm for EDSM, so it
+clears 84 mm on one row.
+
+`n` is the number of sampling locations plotted. TPS station codes are unique per
+tow-year, so a TPS marker is one tow; EDSM revisits stations, so an EDSM marker
+is one station (4,241 EDSM tows at 1,005 stations) — worth stating in the caption.
+
+```{r waterbody-stack, message=FALSE, warning=FALSE}
+W_WB      <- 84 / 25.4
+LEG_CLEAR <- 6.0     # mm of empty map reserved under BOTH panels for the legend
+
+wb_levels <- c("Shoal", "Distributary", "Terminal")
+
+# Short display names; the data still carries the full "... Channel" labels.
+short_wb <- c("Shoal" = "Shoal",
+              "Distributary Channel" = "Distributary",
+              "Terminal Channel"     = "Terminal")
+
+bb_t <- st_bbox(tps_wb_sf); bb_e <- st_bbox(edsm_wb_sf)
+XLIM <- c(min(bb_t["xmin"], bb_e["xmin"]) - 0.015,
+          max(bb_t["xmax"], bb_e["xmax"]) + 0.015)
+YMAX <- max(bb_t["ymax"], bb_e["ymax"]) + 0.015
+YMIN <- min(bb_t["ymin"], bb_e["ymin"])
+
+# Degrees of latitude per inch of panel depends only on the shared x extent, so
+# mm of legend clearance converts to degrees before the panel height is known.
+DEG_PER_IN <- diff(XLIM) * cos(mean(c(YMIN, YMAX)) * pi / 180) / W_WB
+
+ext_wb <- list(xlim = unname(XLIM),
+               ylim = unname(c(YMIN - (LEG_CLEAR / 25.4) * DEG_PER_IN, YMAX)))
+H_WB   <- W_WB * map_aspect(ext_wb) * 2
+
+STROKE      <- 0.14
+EMPH_STROKE <- 0.30
+
+#' @param emph level given the white-ring treatment, or NULL
+wb_panel <- function(sfobj, label, size_range = c(0.55, 0.95),
+                     emph = "Terminal Channel", emph_size = 1.15) {
+  v      <- sfobj$waterbody
+  counts <- sort(table(v), decreasing = TRUE)
+  lv     <- names(counts)                      # most common -> rarest
+  sizes  <- setNames(seq(size_range[1], size_range[2], length.out = length(lv)), lv)
+  if (!is.null(emph) && emph %in% lv) sizes[emph] <- emph_size
+
+  # Per-panel legend labels, so each n belongs to the map above it.
+  n_here <- table(recode(v, !!!short_wb))
+  labs   <- setNames(sprintf("%s (n = %d)", wb_levels, n_here[wb_levels]), wb_levels)
+
+  p <- ggplot() + basemap_layer()
+
+  # Drawn most common first, so the rarest level ends up on top.
+  for (l in lv) {
+    d <- sfobj[v == l, ]
+    if (identical(l, emph)) {
+      p <- p + geom_sf(data = d, aes(fill = short_wb[waterbody]), shape = 21,
+                       colour = "white", size = sizes[[l]], stroke = EMPH_STROKE)
+    } else {
+      p <- p + geom_sf(data = d, aes(fill = short_wb[waterbody]), shape = 21,
+                       colour = pal_stroke[[l]], size = sizes[[l]], stroke = STROKE)
+    }
+  }
+
+  p +
+    corner_label(ext_wb, label) +
+    scale_fill_manual(values = setNames(unname(pal[names(short_wb)]), short_wb),
+                      breaks = wb_levels, limits = wb_levels,
+                      labels = labs, name = NULL, drop = FALSE) +
+    coord_sf(xlim = ext_wb$xlim, ylim = ext_wb$ylim, expand = FALSE, crs = 4326) +
+    panel_theme() +
+    guides(fill = guide_legend(nrow = 1, override.aes = list(
+      size   = 1.35,
+      colour = c(pal_stroke[["Shoal"]], pal_stroke[["Distributary Channel"]], "white"),
+      stroke = c(STROKE, STROKE, EMPH_STROKE)))) +
+    theme(
+      legend.position        = "inside",
+      legend.position.inside = c(0.5, 0.010),
+      legend.justification   = c(0.5, 0),
+      legend.direction       = "horizontal",
+      legend.background      = element_rect(fill = "white", colour = NA),
+      legend.key             = element_blank(),
+      legend.text            = element_text(size = BASE_PT, margin = margin(l = 1, r = 3)),
+      legend.key.size        = unit(6, "pt"),
+      legend.key.spacing.x   = unit(0, "pt"),
+      legend.margin          = margin(1.5, 2.5, 1.5, 1.5),
+      legend.box.spacing     = unit(0, "pt")
+    )
+}
+
+p_wb <- wb_panel(tps_wb_sf, "TPS") / wb_panel(edsm_wb_sf, "EDSM") + NO_MARGIN
+print(p_wb)
+
+ggsave("output_figs/TPS_EDSM_waterbody_map.pdf",  p_wb, width = W_WB, height = H_WB)
+ggsave("output_figs/TPS_EDSM_waterbody_map.tiff", p_wb, width = W_WB, height = H_WB,
+       dpi = 600, compression = "lzw")
+ggsave("output_figs/TPS_EDSM_waterbody_map_preview.png", p_wb,
+       width = W_WB, height = H_WB, dpi = 600)
+
+cat(sprintf("water body figure: %.1f x %.1f mm\n", W_WB * 25.4, H_WB * 25.4))
+cat(sprintf("clearance %.1f mm | lowest point %.4f | panel floor %.4f\n",
+            LEG_CLEAR, YMIN, ext_wb$ylim[1]))
+```

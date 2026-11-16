@@ -1,0 +1,206 @@
+---
+title: "Covariate correlation matrices by survey and water year"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 04 — collinearity screen.**
+>
+> **Purpose.** Pearson correlation matrices (scatter + lowess below the diagonal, r with
+> significance stars above, histograms on the diagonal) for every z-scored covariate, one figure
+> per survey x water year, at 174 mm with an 8 pt floor on every label.
+>
+> **Inputs.** `data/tow_12_6_tps_wq_nona.csv`, `data/tow_12_6_edsm_wq_nona.csv`.
+> **Outputs.** `output_figs/corr_tps_WY<year>.{pdf,tiff,png}`, `output_figs/corr_edsm_WY<year>.{pdf,tiff,png}`.
+>
+> (Moved verbatim from section 7 of `03_tps_forklength_models/gear_check_mamou_vs_otter.Rmd`.)
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+dir.create("output_figs", showWarnings = FALSE)
+```
+
+# Covariate correlation matrices (TPS and EDSM, by water year)
+
+Diagnostic for the main modelling frames: one pairs-plot correlation matrix per survey and
+water year, over every z-scored covariate in the model dataset plus day of water year. Used to
+screen collinearity before building the model sets (e.g. temperature tracks `water_year_day`
+at r = 0.75-0.95 in every year, so it was left out of the main sets).
+
+`chart.Correlation()` is base graphics built on `pairs()`, so it cannot be
+faceted the way a ggplot can. The equivalent is one matrix per water year, drawn
+in a loop.
+
+**On the 8 pt minimum.** `PerformanceAnalytics::chart.Correlation()` cannot be
+made to respect a floor through its arguments: it sizes each correlation number
+as `cex * (abs(r) + 0.3) / 1.3`, so a near-zero r renders at ~23% of the base
+size no matter what `cex.cor` is passed. `chart_corr8()` below is a drop-in
+replacement using the same `pairs()` layout and the same panels, with every
+`cex` floored at `MIN_CEX`. Devices are opened with `pointsize = 8`, so
+`cex = 1` is exactly 8 pt and nothing can render smaller; the emphasis-by-|r|
+effect is kept, it just scales upward from 8 pt instead of downward.
+
+```{r corr-setup, message=FALSE}
+tps_wq  <- read.csv("data/tow_12_6_tps_wq_nona.csv")
+edsm_wq <- read.csv("data/tow_12_6_edsm_wq_nona.csv")
+
+# every z-scored covariate present, plus day of water year
+covar_cols <- function(df) {
+  cols <- grep("_z$|^water_year_day$", names(df), value = TRUE)
+  # Older copies of the model CSVs carry an annual (one value per water year) index that is
+  # not a covariate in any reported model; keep it out of the matrices if present.
+  cols[!grepl("spawner", cols)]
+}
+
+MIN_CEX  <- 1   # x device pointsize; devices below are opened at pointsize = 8
+PT       <- 8
+
+covar_cols(tps_wq)
+covar_cols(edsm_wq)
+```
+
+```{r corr-fun}
+chart_corr8 <- function(d, main = "", method = "pearson") {
+
+  panel_cor <- function(x, y, digits = 2, ...) {
+    usr <- par("usr"); on.exit(par(usr = usr)); par(usr = c(0, 1, 0, 1))
+    r    <- cor(x, y, use = "pairwise.complete.obs", method = method)
+    txt  <- format(c(r, 0.123456789), digits = digits)[1]
+    base <- 0.8 / strwidth(txt)               # size that fills ~80% of the panel
+    # keep chart.Correlation's emphasis-by-|r|, but never shrink below MIN_CEX
+    text(0.5, 0.5, txt, cex = max(MIN_CEX, base * (abs(r) + 0.3) / 1.3))
+    p   <- suppressWarnings(
+             cor.test(as.numeric(x), as.numeric(y), method = method)$p.value)
+    sig <- symnum(p, corr = FALSE, na = FALSE,
+                  cutpoints = c(0, .001, .01, .05, .1, 1),
+                  symbols   = c("***", "**", "*", ".", " "))
+    text(0.82, 0.82, sig, cex = max(MIN_CEX, base * 0.7), col = 2)
+  }
+
+  panel_smooth <- function(x, y, col = "black", bg = NA, pch = 19, cex = 0.35,
+                           col.smooth = "red", span = 2/3, iter = 3, ...) {
+    points(x, y, pch = pch, col = col, bg = bg, cex = cex)
+    ok <- is.finite(x) & is.finite(y)
+    if (any(ok))
+      lines(stats::lowess(x[ok], y[ok], f = span, iter = iter), col = col.smooth)
+  }
+
+  panel_hist <- function(x, ...) {
+    usr <- par("usr"); on.exit(par(usr = usr)); par(usr = c(usr[1:2], 0, 1.5))
+    h  <- hist(x, plot = FALSE); br <- h$breaks; nB <- length(br)
+    rect(br[-nB], 0, br[-1], h$counts / max(h$counts),
+         col = "grey85", border = "grey40")
+    tryCatch({
+      dn <- density(x, na.rm = TRUE, adjust = 1.2)
+      lines(dn$x, dn$y / max(dn$y), col = "red", lwd = 1)
+    }, error = function(e) NULL)
+    rug(x)
+  }
+
+  pairs(d, gap = 0, main = main,
+        oma = c(4, 4, 8, 4),           # top margin widened for the 2-line title
+        cex.axis   = MIN_CEX,          # tick labels
+        cex.labels = MIN_CEX,          # variable names on the diagonal
+        cex.main   = MIN_CEX * 1.25,
+        lower.panel = panel_smooth,
+        upper.panel = panel_cor,
+        diag.panel  = panel_hist)
+}
+
+# Display-only labels: the two distance names are too long to fit a diagonal
+# panel at 174 mm / 8 pt. Applied at plot time; the data columns are untouched.
+display_names <- function(nms) {
+  nms <- sub("^distance_along_channel_z$", "dist_along_chan_z", nms)
+  nms <- sub("^distance_m_z$",             "dist_off_chan_z",   nms)
+  # dist_along_chan_z fills 94% of a diagonal panel and its trailing "_z" still
+  # got clipped once the histogram is drawn, so the suffix comes off everything.
+  # Every covariate here is z-scored anyway -- noted in the figure title instead.
+  sub("_z$", "", nms)
+}
+
+chart_year <- function(df, yr, label) {
+  d <- df[df$water_year == yr, covar_cols(df), drop = FALSE]
+  # drop any column that is constant within this water year: a zero-variance column
+  # makes the correlation undefined
+  d <- d[, vapply(d, function(v) length(unique(v[!is.na(v)])) > 1, logical(1)),
+         drop = FALSE]
+  # display-only rename: the full name overflows its diagonal panel at 174 mm / 8 pt
+  DISPLAY_NAMES <- c(distance_along_channel_z = "dist_along_chan")
+  hit <- names(d) %in% names(DISPLAY_NAMES)
+  names(d)[hit] <- DISPLAY_NAMES[names(d)[hit]]
+  names(d) <- display_names(names(d))
+  suppressWarnings(chart_corr8(
+    d, main = sprintf("%s  -  water year %s  (n = %d tows)\nall covariates z-scored",
+                      label, yr, nrow(d))))
+  invisible(names(d))
+}
+
+# Draw to output_figs and inline; panel size scales with the number of covariates.
+# 174 mm square: a correlation matrix is n x n panels, so the figure is square by
+# construction and the double-column width sets both dimensions.
+WIDTH_MM <- 174
+DPI_TIFF <- 600
+
+chart_year_saved <- function(df, yr, label, slug) {
+  file <- sprintf("output_figs/corr_%s_WY%s", slug, yr)
+  inch <- WIDTH_MM / 25.4
+
+  pdf(paste0(file, ".pdf"), width = inch, height = inch, pointsize = PT)
+  chart_year(df, yr, label); dev.off()
+
+  # ragg, not grDevices::tiff(): on macOS the latter defaults to type = "quartz",
+  # which warns "compression is not supported" and writes ~64 MB of uncompressed
+  # RGBA per figure at 600 dpi. The cairo type would compress but needs XQuartz.
+  # (ggsave() already routes TIFF through ragg, which is why the ggplot figures
+  # in section 6 came out compressed.)
+  if (requireNamespace("ragg", quietly = TRUE)) {
+    ragg::agg_tiff(paste0(file, ".tiff"), width = WIDTH_MM, height = WIDTH_MM,
+                   units = "mm", res = DPI_TIFF, compression = "lzw",
+                   pointsize = PT)
+  } else {
+    tiff(paste0(file, ".tiff"), width = WIDTH_MM, height = WIDTH_MM,
+         units = "mm", res = DPI_TIFF, compression = "lzw", pointsize = PT)
+  }
+  chart_year(df, yr, label); dev.off()
+
+  png(paste0(file, ".png"), width = WIDTH_MM, height = WIDTH_MM, units = "mm",
+      res = 150, pointsize = PT)
+  chart_year(df, yr, label); dev.off()
+
+  chart_year(df, yr, label)
+}
+```
+
+## TPS
+
+```{r corr-tps, fig.width=11, fig.height=11, results="hide", dev.args=list(pointsize=8)}
+for (yr in sort(unique(tps_wq$water_year))) chart_year_saved(tps_wq, yr, "TPS", "tps")
+```
+
+## EDSM
+
+```{r corr-edsm, fig.width=9, fig.height=9, results="hide", dev.args=list(pointsize=8)}
+for (yr in sort(unique(edsm_wq$water_year))) chart_year_saved(edsm_wq, yr, "EDSM", "edsm")
+```
+
+```{r corr-files}
+list.files("output_figs", pattern = "^corr_(tps|edsm)_WY", full.names = TRUE)
+```

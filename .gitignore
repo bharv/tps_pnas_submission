@@ -1,0 +1,21 @@
+# =============================================================================
+# CODE-ONLY repository: data, model fits, caches, rendered notebooks and figures
+# are never committed. Ignore every file, then re-include only code / docs.
+# =============================================================================
+*
+!*/
+!.gitignore
+!*.R
+!*.Rmd
+!*.Rproj
+!README.md
+!LICENSE*
+
+# never descend into data / output folders, even if they contain code-like files
+.Rproj.user/
+data/
+fits*/
+cache/
+output_figs*/
+renv/library/
+*_files/

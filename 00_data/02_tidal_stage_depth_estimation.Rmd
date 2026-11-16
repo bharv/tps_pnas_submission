@@ -1,0 +1,310 @@
+---
+title: "Per-station tidal stage and bathymetric depth estimate (TPS)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 00-2 — data preparation (depth validation).**
+>
+> **Purpose.** Estimate, for every TPS station at its sample date-time, the water-surface
+> elevation (NOAA CO-OPS gauges, NAVD88), the tidal stage, and a bathymetry-based water depth
+> (WSE minus DEM bed elevation), and compare these with the field-recorded tide and start depth.
+>
+> **Web data.** This notebook calls the NOAA CO-OPS data and metadata APIs and the NOAA VDatum
+> API directly (endpoints in the `setup` chunk, request helpers in `helpers`, the pull in
+> `compute`). The DEM bed elevations are read from `data/tps_bed_navd88.csv`, produced by
+> `download_dem_and_extract_beds()` in `00_data/00_download_web_data.R`.
+>
+> **Inputs.** `data/tps_forklength_data.csv`, `data/Tidal_Parr_Complete_tides.csv`,
+> `data/station_code_timestamp.csv`, `data/Tide_Stations.csv`, `data/tps_bed_navd88.csv`.
+>
+> **Output.** `data/tps_station_depth_tide.csv` (one row per StationCode, metric).
+>
+> **Cost.** A few minutes (network-bound).
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+For each trawl `StationCode` at its **sample date-time**, estimate a water-surface elevation
+(WSE, NAVD88) and a **tidal stage** (flood/ebb/slack) from NOAA stage data, pull the bed
+elevation from a NAVD88 bathymetric DEM, and assemble a **per-station comparative table**
+(one row per `StationCode`, ~69 stations) against the field-recorded `Tide` and `Start_Depth`.
+The table is keyed by `StationCode` so it can be joined back to the fork-length data.
+
+**All elevations/depths are in metres (NAVD88 where vertical).** `Start_Depth` (field, feet)
+is converted to metres.
+
+Date-times are pooled from `data/Tidal_Parr_Complete_tides.csv` (2019) and
+`data/station_code_timestamp.csv` (2018/2020/2021) — together covering all 134 fish rows,
+which collapse to 69 stations.
+
+WSE source routing: operational gauges Port Chicago (9415144) & Martinez-Amorco (9415102) →
+observed NAVD88; all other (subordinate) stations → MLLW predictions + a **per-station
+VDatum MLLW→NAVD88 offset** (NOAA VDatum REST API, evaluated at the NOAA gauge location;
+falls back to a regional proxy if VDatum is unavailable). To keep it cheap, NOAA is queried
+only in a short window around each sample (cached per station+source+date).
+
+Bathymetry: `bed_navd88_m` is read from the 2016 USGS/DWR SF Bay-Delta 10-m DEM (NAVD88,
+metres), cached to `data/tps_bed_navd88.csv` (so this notebook does not need the 1.28 GB DEM
+on re-render). `bed_navd88_m` is the **exact DEM cell at the station coordinates** — the
+coordinates are precise, so the cell at the GPS location is used as-is (no buffering), even
+where it falls on a bank.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(jsonlite)
+
+NOAA   <- "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+MDAPI  <- "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations"
+VDATUM <- "https://vdatum.noaa.gov/vdatumweb/api/convert"
+OPERATIONAL <- c("9415144", "9415102")   # verified: continuous obs water level + NAVD88
+SLACK_MIN   <- 45                        # +/- minutes from an extreme counted as slack
+FT2M        <- 0.3048
+```
+
+## NOAA / VDatum helpers (metric)
+
+```{r helpers}
+# Series (NAVD88, metres) for a short window: observed for operational, MLLW->NAVD88 predictions else.
+fetch_series <- function(station, source, begin, end, offset){
+  if(source == "observed_NAVD88"){
+    u <- sprintf("%s?product=water_level&application=tps&begin_date=%s&end_date=%s&datum=NAVD&station=%s&time_zone=lst_ldt&units=metric&format=json",
+                 NOAA, format(begin,"%Y%m%d"), format(end,"%Y%m%d"), station)
+    j <- tryCatch(fromJSON(u), error = function(e) NULL)
+    if(is.null(j$data)) return(tibble())
+    return(transmute(j$data, dt = ymd_hm(t), val = as.numeric(v)))
+  }
+  # predictions: 6-min for harmonic stations, else densify high/low with half-cosine
+  pred <- function(interval){
+    iv <- if(is.null(interval)) "" else paste0("&interval=", interval)
+    u <- sprintf("%s?product=predictions&application=tps&begin_date=%s&end_date=%s&datum=MLLW%s&station=%s&time_zone=lst_ldt&units=metric&format=json",
+                 NOAA, format(begin,"%Y%m%d"), format(end,"%Y%m%d"), iv, station)
+    tryCatch(fromJSON(u), error = function(e) NULL)
+  }
+  j <- pred(NULL)
+  if(!is.null(j$predictions) && is.null(j$predictions$type)){
+    s <- transmute(j$predictions, dt = ymd_hm(t), val = as.numeric(v))
+  } else {
+    jh <- pred("hilo"); if(is.null(jh$predictions)) return(tibble())
+    hl <- transmute(jh$predictions, dt = ymd_hm(t), val = as.numeric(v)) %>% arrange(dt)
+    grid <- seq(min(hl$dt), max(hl$dt), by = "6 min")
+    vals <- map_dbl(grid, function(tt){
+      i <- max(which(hl$dt <= tt)); if(i >= nrow(hl)) return(hl$val[nrow(hl)])
+      a <- hl[i,]; b <- hl[i+1,]
+      f <- as.numeric(difftime(tt, a$dt, units="secs")) / as.numeric(difftime(b$dt, a$dt, units="secs"))
+      a$val + (b$val - a$val) * (1 - cos(pi*f))/2
+    })
+    s <- tibble(dt = grid, val = vals)
+  }
+  mutate(s, val = val + offset)   # MLLW -> NAVD88 (metres)
+}
+
+# MLLW->NAVD88 and MSL->NAVD88 offsets (metres) from the datums product (NAVD only at operational stns).
+station_datums <- function(station){
+  d <- tryCatch(fromJSON(sprintf("%s/%s/datums.json?units=metric", MDAPI, station)),
+                error = function(e) NULL)
+  if(is.null(d$datums)) return(c(mllw_navd = NA, msl_navd = NA))
+  v <- setNames(d$datums$value, d$datums$name)
+  c(mllw_navd = if(all(c("MLLW","NAVD88") %in% names(v))) unname(v["MLLW"]-v["NAVD88"]) else NA,
+    msl_navd  = if(all(c("MSL","NAVD88")  %in% names(v))) unname(v["MSL"] -v["NAVD88"]) else NA)
+}
+
+# Per-point VDatum MLLW(m)->NAVD88(m) offset; with s_z=0 the returned t_z IS the offset (metres).
+vd_cache <- new.env()
+vdatum_offset <- function(id, lon, lat){
+  key <- as.character(id)
+  if(!is.null(vd_cache[[key]])) return(vd_cache[[key]])
+  u <- sprintf("%s?s_x=%f&s_y=%f&s_z=0&region=westcoast&s_coor=geo&s_h_frame=IGS14&t_h_frame=NAD83_2011&s_v_frame=MLLW&s_v_unit=m&t_v_frame=NAVD88&t_v_unit=m",
+               VDATUM, lon, lat)
+  j   <- tryCatch(fromJSON(u), error = function(e) NULL)
+  off <- if(!is.null(j$t_z)) suppressWarnings(as.numeric(j$t_z)) else NA_real_
+  vd_cache[[key]] <- off
+  off
+}
+
+# Tidal stage from a stage series at time t: Flood/Ebb (Early/Late) or High/Low Slack.
+classify_stage <- function(s, t){
+  if(nrow(s) < 5) return(NA_character_)
+  s <- arrange(s, dt)
+  sm <- stats::filter(s$val, rep(1/5, 5)); sm[is.na(sm)] <- s$val[is.na(sm)]  # ~30-min smooth
+  dsign <- sign(diff(sm))
+  ext_i <- which(dsign[-1] != dsign[-length(dsign)]) + 1                       # turning points
+  ext <- tibble(dt = s$dt[ext_i], val = s$val[ext_i],
+                type = if_else(diff(sm)[ext_i-1] > 0, "High", "Low"))
+  if(nrow(ext) == 0) return(if(approx(as.numeric(s$dt), s$val, as.numeric(t+1800))$y >
+                               approx(as.numeric(s$dt), s$val, as.numeric(t-1800))$y) "Flood" else "Ebb")
+  near <- ext[which.min(abs(difftime(ext$dt, t, units="mins"))), ]
+  if(abs(as.numeric(difftime(near$dt, t, units="mins"))) <= SLACK_MIN)
+    return(paste(near$type, "Slack"))
+  prev <- ext %>% filter(dt <= t) %>% slice_tail(n=1)
+  nxt  <- ext %>% filter(dt >  t) %>% slice_head(n=1)
+  if(nrow(prev)==0 || nrow(nxt)==0){
+    rising <- approx(as.numeric(s$dt), s$val, as.numeric(t+1800))$y >
+              approx(as.numeric(s$dt), s$val, as.numeric(t-1800))$y
+    return(if(rising) "Flood" else "Ebb")
+  }
+  phase <- if(nxt$type == "High") "Flood" else "Ebb"
+  frac  <- as.numeric(difftime(t, prev$dt, units="secs")) /
+           as.numeric(difftime(nxt$dt, prev$dt, units="secs"))
+  paste(if(frac < 0.5) "Early" else "Late", phase)
+}
+```
+
+## Assemble per-station samples and offsets
+
+```{r samples, message=FALSE}
+fl <- read_csv("data/tps_forklength_data.csv", show_col_types = FALSE)
+
+ts <- bind_rows(
+  read_csv("data/Tidal_Parr_Complete_tides.csv", show_col_types = FALSE) %>% select(Site_Id, Date_Time),
+  read_csv("data/station_code_timestamp.csv",   show_col_types = FALSE) %>% select(Site_Id, Date_Time)
+) %>%
+  mutate(dt = parse_date_time(Date_Time, orders = "mdY HM")) %>%
+  filter(!is.na(dt)) %>% distinct(Site_Id, .keep_all = TRUE)
+
+# NOAA tide-station locations (used both for nearest-station and for per-station VDatum offsets).
+stn <- read_csv("data/Tide_Stations.csv", show_col_types = FALSE) %>%
+  rename(lat = Latitude, lon = Longitude) %>% filter(grepl("^94", stationID))
+nearest_stn <- function(la, lo){
+  d <- sqrt((stn$lat-la)^2 + ((stn$lon-lo)*cos(la*pi/180))^2); stn$stationID[which.min(d)]
+}
+
+# One row per StationCode (Start_Depth / Tide / coords are constant within a station; only
+# fork length varies across the duplicate fish rows).
+samples <- fl %>%
+  distinct(StationCode, .keep_all = TRUE) %>%
+  left_join(select(ts, Site_Id, dt), by = c("StationCode" = "Site_Id")) %>%
+  filter(!is.na(dt)) %>%
+  transmute(StationCode, dt, Year, Tide_field = Tide,
+            start_depth_m = Start_Depth * FT2M,
+            lat = Station_Latitude, lon = Station_Longitude) %>%
+  mutate(near_id = map2_chr(lat, lon, nearest_stn),
+         source  = if_else(near_id %in% OPERATIONAL, "observed_NAVD88", "pred_MLLW"))
+
+cat("stations:", nrow(samples), "of", n_distinct(fl$StationCode), "unique StationCodes\n")
+
+# Regional reference offsets from the operational gauges.
+op <- map(OPERATIONAL, station_datums)
+mllw_navd_proxy <- mean(map_dbl(op, "mllw_navd"))   # fallback for subordinate stations
+msl_navd_ref    <- mean(map_dbl(op, "msl_navd"))    # MSL height in NAVD88 (mean-water reference, m)
+cat(sprintf("regional MLLW->NAVD88 proxy = %.2f m | MSL(NAVD88) ref = %.2f m\n",
+            mllw_navd_proxy, msl_navd_ref))
+
+# Per-station VDatum MLLW->NAVD88 offsets at each used (subordinate) NOAA gauge; fall back to proxy.
+used_sub <- samples %>% filter(source == "pred_MLLW") %>% distinct(near_id) %>%
+  left_join(select(stn, stationID, lat, lon), by = c("near_id" = "stationID"))
+used_sub <- used_sub %>%
+  mutate(vdatum_offset_m = pmap_dbl(list(near_id, lon, lat), vdatum_offset))
+n_vd <- sum(!is.na(used_sub$vdatum_offset_m))
+cat(sprintf("VDatum offsets: %d of %d subordinate gauges resolved (rest use regional proxy)\n",
+            n_vd, nrow(used_sub)))
+offset_map <- used_sub %>%
+  transmute(near_id, offset = coalesce(vdatum_offset_m, mllw_navd_proxy)) %>%
+  deframe()
+station_offset <- function(id, src) if(src == "observed_NAVD88") 0 else unname(offset_map[as.character(id)])
+```
+
+## Pull stage windows (cached) and compute WSE + tidal stage (metres)
+
+```{r compute, message=FALSE, warning=FALSE}
+cache <- new.env()
+get_window <- function(id, source, day){
+  key <- paste(id, source, day)
+  if(is.null(cache[[key]]))
+    cache[[key]] <- fetch_series(id, source, as.Date(day) - 1, as.Date(day) + 1,
+                                 offset = station_offset(id, source))
+  cache[[key]]
+}
+
+res <- samples %>%
+  mutate(
+    vdatum_offset_m = map2_dbl(near_id, source, station_offset),
+    wse_navd88_m    = pmap_dbl(list(near_id, source, dt), function(id, src, t){
+      s <- get_window(id, src, as.Date(t)); if(nrow(s)==0) return(NA_real_)
+      approx(as.numeric(s$dt), s$val, as.numeric(t))$y }),
+    tidal_stage_est = pmap_chr(list(near_id, source, dt), function(id, src, t){
+      classify_stage(get_window(id, src, as.Date(t)), t) }),
+    tide_anom_m     = wse_navd88_m - msl_navd_ref,   # +above / -below mean water (m)
+    depth_norm_m    = start_depth_m - tide_anom_m    # field depth referenced to mean water (m)
+  )
+
+cat("WSE computed:", sum(!is.na(res$wse_navd88_m)), "of", nrow(res),
+    "| tidal stage computed:", sum(!is.na(res$tidal_stage_est)), "\n")
+```
+
+## Join cached bed elevations and build the comparison
+
+```{r bed, message=FALSE}
+bed <- read_csv("data/tps_bed_navd88.csv", show_col_types = FALSE)   # from the 2016 SF Bay-Delta 10-m DEM
+
+comp <- res %>%
+  left_join(bed, by = "StationCode") %>%
+  mutate(
+    est_depth_m   = wse_navd88_m - bed_navd88_m,        # bathymetry-based water depth (m)
+    depth_resid_m = est_depth_m - start_depth_m         # estimate minus field depth (m)
+  ) %>%
+  transmute(StationCode, datetime = dt, Year,
+            Tide_field, tidal_stage_est,
+            near_id, source, vdatum_offset_m = round(vdatum_offset_m, 3),
+            wse_navd88_m  = round(wse_navd88_m, 3),
+            tide_anom_m   = round(tide_anom_m, 3),
+            start_depth_m = round(start_depth_m, 2),
+            depth_norm_m  = round(depth_norm_m, 2),
+            bed_navd88_m,
+            est_depth_m   = round(est_depth_m, 2),
+            depth_resid_m = round(depth_resid_m, 2)) %>%
+  arrange(datetime)
+
+# Field vs estimated stage, where field tide was recorded.
+simplify <- function(x) str_remove(x, "^(Early|Late)\\s+")
+check <- comp %>% filter(!is.na(Tide_field)) %>%
+  mutate(agree = simplify(Tide_field) == simplify(tidal_stage_est))
+cat(sprintf("Field tide recorded for %d stations; phase agreement (Flood/Ebb/Slack): %d (%.0f%%)\n",
+            nrow(check), sum(check$agree), 100*mean(check$agree)))
+
+# Depth comparison summary.
+dd <- comp %>% filter(!is.na(depth_resid_m))
+cat(sprintf("Depth comparison (n=%d): median resid = %.2f m | MAE = %.2f m | corr(est, field) = %.2f\n",
+            nrow(dd), median(dd$depth_resid_m), mean(abs(dd$depth_resid_m)),
+            cor(dd$est_depth_m, dd$start_depth_m)))
+
+write_csv(comp, "data/tps_station_depth_tide.csv")
+cat("saved -> data/tps_station_depth_tide.csv (", nrow(comp), "stations )\n")
+head(comp, 15)
+```
+
+`data/tps_station_depth_tide.csv` is the deliverable — **one row per `StationCode`** (join key
+to the fork-length data). All metric. Columns:
+
+- `Tide_field` / `tidal_stage_est` — recorded vs stage-derived tide phase.
+- `near_id` / `source` — nearest NOAA gauge and whether WSE is observed NAVD88 or
+  MLLW-prediction + offset; `vdatum_offset_m` — the per-station MLLW→NAVD88 offset applied
+  (0 for observed gauges).
+- `wse_navd88_m` — estimated water-surface elevation (NAVD88, m); `tide_anom_m` — WSE relative
+  to mean water; `start_depth_m` — recorded depth (m); `depth_norm_m` — recorded depth corrected
+  to mean water.
+- `bed_navd88_m` — DEM bed elevation at the exact station cell (no buffering).
+  `est_depth_m = wse_navd88_m - bed_navd88_m` is the bathymetry-based depth;
+  `depth_resid_m = est_depth_m - start_depth_m` is the comparison.
+
+**Caveats:** subordinate-station WSE uses the nearest NOAA gauge's tide curve as a spatial proxy
+(tidal phase/amplitude shift across the estuary) and per-station VDatum offsets (±~0.08 m model
+uncertainty); predictions, not observations, drive most rows. `bed_navd88_m` is the single 10-m
+DEM cell at the station coordinates (some cells fall on banks, so `est_depth_m` can be small or
+negative), and `Start_Depth` is a rough field reading, so `depth_resid_m` carries several-metre
+scatter.

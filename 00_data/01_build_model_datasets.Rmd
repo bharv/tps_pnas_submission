@@ -1,0 +1,263 @@
+---
+title: "Build the model datasets (TPS catch, EDSM catch, TPS fork length)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 00-1 — data preparation.**
+>
+> **Purpose.** Turn the survey-supplied tow and fish tables into the four modelling frames every
+> model, diagnostic and figure in this repository reads:
+>
+> | file | rows | used by |
+> |---|---|---|
+> | `tow_12_6_tps_nona.csv` | 838 | TPS landscape catch models (`01_tps_catch_models/tps_catch_landscape_models.Rmd`) |
+> | `tow_12_6_tps_wq_nona.csv` | 818 | TPS water-quality / edge catch models (`01_tps_catch_models/tps_catch_wq_models.Rmd`) |
+> | `tow_12_6_edsm_wq_nona.csv` | 4,241 | EDSM catch models (`02_edsm_catch_models/edsm_catch_kfold_models.Rmd`) |
+> | `tps_forklength_data.csv` | 134 | TPS fork-length models (`03_tps_forklength_models/`) |
+>
+> **Inputs (supplied by the survey programs, not downloaded by code).**
+> `data/All_Surveys_Combined_v7.3.csv` — one row per tow, TPS + EDSM (+ SKT, dropped here), with
+> catch, effort (`Volume`), water quality, distances, habitat/edge class and
+> `OUT_Moving_Mean_30d` (30-day trailing mean Delta outflow, cfs) already attached.
+> `data/TPSCatchWithCSLength.csv` — one row per measured TPS Chinook.
+>
+> **Outputs.** written to `OUT_DIR` (default `data/rebuilt/`, so the files the published fits were
+> built from are never overwritten). The final chunk checks the rebuilt files against `data/`.
+> Set `OUT_DIR <- "data"` only to regenerate in place.
+>
+> **Cost.** Seconds.
+>
+> Extracted from the project's original exploratory notebooks
+> (`tidal-parr-trawl-analysis2_offset_fix.Rmd`, `tidal-parr-forklength-analysis2.Rmd`); the
+> modelling-frame logic is unchanged.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(EflowStats)   # get_waterYear(), get_waterYearDay(): US water year (Oct 1 - Sep 30)
+library(oce)          # swSCTp(): practical salinity (PSS-78) from conductivity
+
+OUT_DIR <- "data/rebuilt"
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Combined tow table: season window, response, catch NA -> 0
+
+```{r tow-wrangling, message=FALSE}
+tow <- read_csv("data/All_Surveys_Combined_v7.3.csv")   # v7.3 = v7.2 + fish-food variables
+
+# Calendar month, day of year, and the water-year clock used by the seasonal spline.
+tow$month          <- tow$Month
+tow$day            <- yday(as.Date(tow$SampleDate, format = "%m/%d/%Y"))
+tow$water_year_day <- get_waterYearDay(as.Date(tow$SampleDate, format = "%m/%d/%Y"))
+tow$water_year     <- get_waterYear(as.Date(tow$SampleDate, format = "%m/%d/%Y"))
+tow <- tow %>% mutate(CPUE_l_75 = as.numeric(CPUE_l_75))
+
+# December-June = the parr out-migration window analysed throughout; SKT is not modelled.
+tow_12_6_not_skt <- tow %>%
+  filter(month %in% c(12, 1:6)) %>%
+  filter(Survey != "SKT")
+tow_12_6_not_skt$survey <- tow_12_6_not_skt$Survey
+tow_12_6_not_skt$lat    <- tow_12_6_not_skt$Station_Latitude
+tow_12_6_not_skt$lon    <- tow_12_6_not_skt$Station_Longitude
+
+# Response: Chinook < 75 mm fork length (n_l_75). Larger fish are more likely hatchery-origin
+# smolts rather than rearing parr. Presence flags kept for the summary tables.
+tow_12_6_not_skt$chinook_present_u75     <- ifelse(is.na(tow_12_6_not_skt$CPUE_l_75) |
+                                                   tow_12_6_not_skt$CPUE_l_75 <= 0, 0, 1)
+tow_12_6_not_skt$chinook_present_allsize <- ifelse(is.na(tow_12_6_not_skt$Chinook_Salmon_CPUE) |
+                                                   tow_12_6_not_skt$Chinook_Salmon_CPUE <= 0, 0, 1)
+
+# A missing catch value means no Chinook were caught in that tow.
+tow_12_6_not_skt$CPUE_l_75           <- ifelse(is.na(tow_12_6_not_skt$CPUE_l_75), 0, tow_12_6_not_skt$CPUE_l_75)
+tow_12_6_not_skt$Chinook_Salmon_CPUE <- ifelse(is.na(tow_12_6_not_skt$Chinook_Salmon_CPUE), 0, tow_12_6_not_skt$Chinook_Salmon_CPUE)
+tow_12_6_not_skt$n_l_75              <- ifelse(is.na(tow_12_6_not_skt$n_l_75), 0, tow_12_6_not_skt$n_l_75)
+
+# EDSM reports specific conductivity, not salinity: fill Salinity from it.
+# NOTE: the conductivity values are in uS/cm but are passed as mS/cm here, exactly as in the
+# original build, so EDSM `Salinity` / `salinity_z` in this file are NOT physically correct.
+# No main-text model uses salinity. The appendix rebuilds a corrected EDSM salinity column
+# (appendix_salinity_temperature_wateryear/A02_build_edsm_salfix_data.R) and uses only that.
+tow_12_6_not_skt <- tow_12_6_not_skt %>%
+  mutate(Salinity = ifelse(
+    is.na(Salinity) & !is.na(Specific_Conductivity) & !is.na(Temperature),
+    swSCTp(c = Specific_Conductivity, t = Temperature, p = rep(0, n()),
+           conductivityUnit = "mS/cm", eos = "unesco"),
+    Salinity))
+
+# lower-case aliases used by some downstream code
+tow_12_6_not_skt$volume        <- tow_12_6_not_skt$Volume
+tow_12_6_not_skt$temperature   <- tow_12_6_not_skt$Temperature
+tow_12_6_not_skt$habitat2020   <- tow_12_6_not_skt$Habitat2020
+
+tow_12_6_tps_full  <- tow_12_6_not_skt %>% filter(Survey == "TPS")
+tow_12_6_edsm_full <- tow_12_6_not_skt %>% filter(Survey == "EDSM")
+```
+
+## 2. TPS landscape frame (`tow_12_6_tps_nona`)
+
+Complete cases on the landscape covariates + Secchi + edge/habitat class. Rip Rap edge tows are
+dropped (too few to estimate). Every `_z` column is centred and scaled on THIS frame.
+
+```{r tps-landscape}
+tow_12_6_tps_nona <- tow_12_6_tps_full %>%
+  select(SampleDate, StationCode, Station_Latitude, Station_Longitude, water_year, Volume,
+         Chinook_Salmon_Catch, n_l_75, CPUE_l_75, Chinook_Salmon_CPUE,
+         chinook_present_u75, chinook_present_allsize, habitat2020, Edge_Type,
+         Distance_m, DistanceAlongChannel, OUT_Moving_Mean_30d, Secchi) %>%
+  filter(Edge_Type != "Riprap") %>%
+  drop_na()
+stopifnot(nrow(tow_12_6_tps_nona) == 838)   # the frame the landscape fits were built on
+
+tow_12_6_tps_nona <- tow_12_6_tps_nona %>% mutate(
+  distance_m_z             = as.vector(scale(Distance_m)),            # distance off channel
+  distance_along_channel_z = as.vector(scale(DistanceAlongChannel)),  # distance along channel
+  out30_z                  = as.vector(scale(OUT_Moving_Mean_30d)),   # 30-d mean outflow
+  water_year_day           = get_waterYearDay(as.Date(SampleDate, format = "%m/%d/%Y")),
+  water_year               = get_waterYear(as.Date(SampleDate, format = "%m/%d/%Y")),
+  secchi_z                 = as.vector(scale(Secchi)))
+
+write.csv(tow_12_6_tps_nona, file.path(OUT_DIR, "tow_12_6_tps_nona.csv"))
+```
+
+## 3. TPS water-quality frame (`tow_12_6_tps_wq_nona`)
+
+Adds the water-quality covariates (pH, temperature, DO, Secchi, salinity, chlorophyll), gear and
+edge class; complete cases only, Rip Rap dropped.
+
+```{r tps-wq}
+tow_12_6_tps_wq_nona <- tow_12_6_tps_full %>%
+  select(SampleDate, StationCode, Station_Latitude, Station_Longitude, water_year, Volume,
+         Chinook_Salmon_Catch, n_l_75, CPUE_l_75, Chinook_Salmon_CPUE,
+         chinook_present_u75, chinook_present_allsize, Distance_m, DistanceAlongChannel,
+         OUT_Moving_Mean_30d, pH, Temperature, Dissolved_Oxygen, Secchi, Salinity,
+         Chlorophyll, habitat2020, Gear, Edge_Type) %>%
+  filter(Edge_Type != "Riprap") %>%
+  drop_na()
+stopifnot(nrow(tow_12_6_tps_wq_nona) == 818)   # the frame fits_tps_wq_Vfix/ was built on
+
+tow_12_6_tps_wq_nona <- tow_12_6_tps_wq_nona %>% mutate(
+  distance_m_z             = as.vector(scale(Distance_m)),
+  distance_along_channel_z = as.vector(scale(DistanceAlongChannel)),
+  out30_z                  = as.vector(scale(OUT_Moving_Mean_30d)),
+  water_year_day           = get_waterYearDay(as.Date(SampleDate, format = "%m/%d/%Y")),
+  water_year               = get_waterYear(as.Date(SampleDate, format = "%m/%d/%Y")),
+  ph_z                     = as.vector(scale(pH)),
+  temperature_z            = as.vector(scale(Temperature)),
+  dox_z                    = as.vector(scale(Dissolved_Oxygen)),
+  secchi_z                 = as.vector(scale(Secchi)),
+  salinity_z               = as.vector(scale(Salinity)),
+  chlorophyll_z            = as.vector(scale(Chlorophyll)))
+
+write.csv(tow_12_6_tps_wq_nona, file.path(OUT_DIR, "tow_12_6_tps_wq_nona.csv"))
+```
+
+## 4. EDSM frame (`tow_12_6_edsm_wq_nona`)
+
+EDSM has no edge-type field. Complete cases on the modelled covariates; multiple tows per site
+visit are kept (they are handled by the `(1 | StationCode)` random intercept and grouped CV).
+
+```{r edsm}
+tow_12_6_edsm_wq_nona <- tow_12_6_edsm_full %>%
+  select(SampleDate, Month, StationCode, Station_Latitude, Station_Longitude, TowNumber, Volume,
+         water_year, Chinook_Salmon_Catch, n_l_75, CPUE_l_75, Chinook_Salmon_CPUE,
+         chinook_present_u75, chinook_present_allsize, Distance_m, DistanceAlongChannel,
+         OUT_Moving_Mean_30d, Temperature, Dissolved_Oxygen, Secchi, Salinity,
+         habitat2020, Gear) %>%
+  drop_na()
+stopifnot(nrow(tow_12_6_edsm_wq_nona) == 4241)  # the frame fits_edsm_Vfix/ was built on
+
+tow_12_6_edsm_wq_nona <- tow_12_6_edsm_wq_nona %>% mutate(
+  distance_m_z             = as.vector(scale(Distance_m)),
+  distance_along_channel_z = as.vector(scale(DistanceAlongChannel)),
+  out30_z                  = as.vector(scale(OUT_Moving_Mean_30d)),
+  water_year_day           = get_waterYearDay(as.Date(SampleDate, format = "%m/%d/%Y")),
+  water_year               = get_waterYear(as.Date(SampleDate, format = "%m/%d/%Y")),
+  temperature_z            = as.vector(scale(Temperature)),
+  dox_z                    = as.vector(scale(Dissolved_Oxygen)),
+  secchi_z                 = as.vector(scale(Secchi)),
+  salinity_z               = as.vector(scale(Salinity)))   # see the NOTE in section 1
+
+write.csv(tow_12_6_edsm_wq_nona, file.path(OUT_DIR, "tow_12_6_edsm_wq_nona.csv"))
+```
+
+## 5. TPS fork-length frame (`tps_forklength_data`)
+
+One row per measured Chinook. Station-level covariates are z-scored on this frame;
+`start_depth_z` is the field-recorded start depth (feet) and `water_year_day_z` the scaled
+season clock (fork length is modelled with a linear season term, not a spline).
+
+```{r forklength, message=FALSE}
+d.tps <- read_csv("data/TPSCatchWithCSLength.csv") %>%
+  filter(!is.na(ChinookLength)) %>%
+  select(StationCode, TowID, Start_Depth, Gear, Station_Latitude, Station_Longitude,
+         Water_Year, SampleDate, Year, Month, Region2020, Habitat2020, Tide, Temperature,
+         Dissolved_Oxygen, Specific_Conductivity, Salinity, pH, Turbidity, Chlorophyll,
+         Secchi, Volume, Freeport_CFS, Vernalis_CFS, OUT, X2, Edge_Type, TowNumber,
+         Target_Caught, fid, DistanceAlongChannel, Distance_m, DistanceToSource,
+         Sac_Water_Year_Type, OUT_Moving_Mean_30d, OUT_Moving_Range_7d, shoreline_Class,
+         distance_to_shoreline_m, ChinookLength, ChinookClipped) %>%
+  # SampleDate is an Excel serial number in this file
+  mutate(SampleDate = as_date(SampleDate, origin = "1899-12-30")) %>%
+  rename(ForkLength = ChinookLength)
+stopifnot(nrow(d.tps) == 134)
+
+d.tps <- d.tps %>% mutate(
+  distance_m_z             = as.vector(scale(Distance_m)),
+  distance_along_channel_z = as.vector(scale(DistanceAlongChannel)),
+  out30_z                  = as.vector(scale(OUT_Moving_Mean_30d)),
+  start_depth_z            = as.vector(scale(Start_Depth)),
+  water_year_day           = get_waterYearDay(as.Date(SampleDate, format = "%m/%d/%Y")),
+  water_year_day_z         = as.vector(scale(water_year_day)),
+  water_year               = get_waterYear(as.Date(SampleDate, format = "%m/%d/%Y")))
+
+write.csv(d.tps, file.path(OUT_DIR, "tps_forklength_data.csv"))
+```
+
+## 6. Check the rebuilt frames against the files the fits were built from
+
+Compares every modelling column (response, offset, covariates, z-scores) of each rebuilt frame
+with the copy in `data/`. Columns that no reported model uses are not compared.
+
+```{r verify, message=FALSE}
+compare_frame <- function(file, cols) {
+  a <- read_csv(file.path(OUT_DIR, file), show_col_types = FALSE)
+  b <- read_csv(file.path("data", file),  show_col_types = FALSE)
+  cols <- intersect(cols, intersect(names(a), names(b)))
+  tibble(file = file, rows_rebuilt = nrow(a), rows_data = nrow(b),
+         columns_compared = length(cols),
+         identical = nrow(a) == nrow(b) &&
+           all(vapply(cols, function(cc) isTRUE(all.equal(a[[cc]], b[[cc]], tolerance = 1e-10)),
+                      logical(1))))
+}
+model_cols <- c("StationCode", "n_l_75", "Volume", "water_year", "water_year_day", "Edge_Type",
+                "habitat2020", "out30_z", "distance_m_z", "distance_along_channel_z",
+                "secchi_z", "dox_z", "ph_z", "chlorophyll_z", "ForkLength", "start_depth_z",
+                "water_year_day_z")
+if (normalizePath(OUT_DIR) != normalizePath("data")) {
+  bind_rows(
+    compare_frame("tow_12_6_tps_nona.csv",     model_cols),
+    compare_frame("tow_12_6_tps_wq_nona.csv",  model_cols),
+    compare_frame("tow_12_6_edsm_wq_nona.csv", model_cols),
+    compare_frame("tps_forklength_data.csv",   model_cols))
+}
+```

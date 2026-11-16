@@ -1,0 +1,757 @@
+---
+title: "Gear check: Mamou vs otter trawl (catch and fork length)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 03 — gear check (supporting).**
+>
+> **Purpose.** Tests whether the two TPS trawl gears (Mamou vs otter) differ in catch or in
+> measured fork length once the model covariates are accounted for, on the subset of tows where
+> both gears were fished, and produces the gear-comparison figures.
+>
+> **Inputs.** `data/tow_12_6_tps_wq_nona.csv`, `data/tow_12_6_edsm_wq_nona.csv`,
+> `data/tps_forklength_data.csv`.
+>
+> **Outputs.** fits in `fits_gear_compare/`; figures `output_figs/gear_*`.
+>
+> (The covariate-correlation matrices that used to sit in section 7 of this notebook now live in
+> `04_diagnostics/covariate_correlations_by_water_year.Rmd`.)
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+Does gear type affect catch of sub-75 mm Chinook, after accounting for the
+predictors that showed a clear effect in the main catch models?
+
+Model formula follows the most recently graphed TPS catch models
+(`tidal-parr-trawl-analysis2_kfold.Rmd`, `build_station_formula()`):
+`n_l_75 ~ <fixef> + s(water_year_day) + offset(log(Volume)) + (1|StationCode)`,
+negative binomial, with `catch_priors`. Here `<fixef>` is `Gear + out30_z +
+Edge_Type`.
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(brms)
+options(mc.cores = parallel::detectCores())
+
+FIT_DIR <- "fits_gear_compare"
+dir.create(FIT_DIR, showWarnings = FALSE)
+force_refit <- FALSE   # TRUE to re-run all fits from scratch
+```
+
+# 1. Build the paired subset
+
+Start from `tow_12_6_tps_wq_nona.csv` -- the same modeling frame the graphed
+catch models used -- so `out30_z`, `water_year_day` and `Edge_Type` are
+constructed identically rather than re-derived here.
+
+```{r load}
+tps <- read.csv("data/tow_12_6_tps_wq_nona.csv") %>%
+  mutate(date = mdy(SampleDate),
+         wk   = isoweek(date),
+         yrwk = paste0(year(date), "-W", sprintf("%02d", wk)))
+
+table(tps$Gear, tps$water_year)
+```
+
+**The Otter net was only ever fished in WY2019** (Jan 23 - May 17, 2019), so the
+comparison is automatically confined to that season. Restrict to weeks in which
+*both* gears were fished:
+
+```{r subset}
+paired <- tps %>%
+  filter(Gear %in% c("Mamou", "Otter")) %>%
+  group_by(yrwk) %>%
+  filter(n_distinct(Gear) == 2) %>%     # keep only weeks where both were fished
+  ungroup() %>%
+  mutate(Gear      = factor(Gear, levels = c("Mamou", "Otter")),  # Mamou = reference
+         Edge_Type = factor(Edge_Type),
+         yrwk      = factor(yrwk))
+
+table(paired$yrwk, paired$Gear)
+```
+
+```{r raw-cpue}
+paired %>%
+  group_by(Gear) %>%
+  summarise(tows = n(), zeros = sum(n_l_75 == 0), positive = sum(n_l_75 > 0),
+            catch = sum(n_l_75), volume = sum(Volume),
+            CPUE_per_10k_m3 = sum(n_l_75) / sum(Volume) * 10000, .groups = "drop")
+```
+
+# 2. Balance check: what else differs between the gears?
+
+This is the part that decides how much the model can be trusted, so look before
+fitting.
+
+```{r balance}
+paired %>%
+  group_by(Gear) %>%
+  summarise(n = n(),
+            median_volume        = round(median(Volume)),
+            median_dist_channel  = round(median(DistanceAlongChannel)),
+            median_dist_m        = round(median(Distance_m)),
+            .groups = "drop")
+
+table(paired$Edge_Type, paired$Gear)
+table(paired$habitat2020, paired$Gear)
+
+# were the two gears ever fished at the same location?
+loc <- paired %>% mutate(loc = paste(round(Station_Latitude, 4),
+                                     round(Station_Longitude, 4)))
+tab <- table(loc$loc, loc$Gear)
+sprintf("locations fished by BOTH gears: %d of %d", sum(tab[,1] > 0 & tab[,2] > 0), nrow(tab))
+```
+
+Three things matter here:
+
+1. **No location was fished by both gears** (0 of 160). This is a *temporally*
+   paired design, not a spatially paired one -- the gears were used in the same
+   weeks but at different sites. Any site-level difference is therefore
+   confounded with gear.
+2. Otter tows sit further down-channel and closer to the channel axis than
+   Mamou tows (median `DistanceAlongChannel` ~16,600 vs ~21,000 m).
+   `habitat2020` and `Edge_Type` are also unbalanced -- Emergent Vegetation is
+   5 Mamou vs 20 Otter.
+3. Within a single water year `out30_z` is a deterministic function of date
+   (16 distinct outflow values over 16 sampling dates), so it is **functionally
+   confounded with `s(water_year_day)`** -- a flexible smooth of day can
+   reproduce the outflow trajectory exactly. Expect the outflow coefficient to
+   be weakly identified. This does *not* threaten the gear contrast, because
+   both gears were fished within the same weeks.
+
+Because there are only 16 unique sampling dates, the smooth basis is capped at
+`k = 5`; the brms default `k = 10` is over-flexible for 16 distinct x-values
+and would soak up between-week variation that the gear term should be competing
+against.
+
+# 3. Models
+
+`catch_priors` copied verbatim from `tidal-parr-trawl-analysis2_kfold.Rmd`.
+
+```{r priors}
+catch_priors <- c(prior(normal(0, 2.5),  class = "b"),
+                  prior(gamma(2, 0.1),   class = "shape"),
+                  prior(normal(-5.5, 2), class = "Intercept"),
+                  prior(normal(20, 5),   class = "sds"))
+
+fit_cached <- function(name, formula, data, priors = catch_priors, ...) {
+  path <- file.path(FIT_DIR, paste0(name, ".rds"))
+  if (!force_refit && file.exists(path)) return(readRDS(path))
+  fit <- brm(formula = formula, family = negbinomial(link = "log"),
+             data = data, prior = priors,
+             iter = 3000, warmup = 2000, chains = 4,
+             control = list(max_treedepth = 12, adapt_delta = 0.99),
+             save_pars = save_pars(all = FALSE), ...)
+  saveRDS(fit, path)
+  fit
+}
+```
+
+```{r fl-fit-helper}
+# gaussian counterpart of fit_cached(), for the fork-length models in section 8
+fit_cached_fl <- function(name, formula, data, priors = fl_priors, ...) {
+  path <- file.path(FIT_DIR, paste0(name, ".rds"))
+  if (!force_refit && file.exists(path)) return(readRDS(path))
+  fit <- brm(formula = formula, family = gaussian(),
+             data = data, prior = priors,
+             iter = 4000, warmup = 2000, chains = 4,
+             control = list(max_treedepth = 12, adapt_delta = 0.99),
+             save_pars = save_pars(all = FALSE), ...)
+  saveRDS(fit, path); fit
+}
+```
+
+## M1 -- as specified
+
+Matches the graphed catch-model structure, with `Gear` added.
+
+Note `(1|StationCode)` is an *observation-level* random effect here: TPS
+StationCodes are unique per tow (`TPS0123.2019`), so there is one level per row.
+That is also true of the graphed models, so it is kept for consistency, but it
+is competing with the negative-binomial `shape` for the same overdispersion.
+
+```{r m1}
+m1 <- fit_cached("m1_requested",
+  n_l_75 ~ Gear + out30_z + Edge_Type + s(water_year_day, k = 5) +
+           offset(log(Volume)) + (1 | StationCode),
+  data = paired)
+summary(m1)
+```
+
+## M2 -- within-week contrast (recommended)
+
+This is the answer to "how do I make sure I only compare paired gear from the
+same time period". Rather than modelling calendar time with a smooth and hoping
+it lines up, make **week the unit of pairing**: a random intercept for `yrwk`
+absorbs everything shared by tows in the same week -- outflow, tide stage, fish
+abundance, run timing -- and the `Gear` coefficient is then estimated *within*
+weeks. It is the design-based version of the comparison, and it drops the
+outflow/day confounding entirely because neither term is needed.
+
+```{r m2}
+m2 <- fit_cached("m2_within_week",
+  n_l_75 ~ Gear + Edge_Type + offset(log(Volume)) + (1 | yrwk),
+  data = paired,
+  priors = c(prior(normal(0, 2.5),  class = "b"),
+             prior(gamma(2, 0.1),   class = "shape"),
+             prior(normal(-5.5, 2), class = "Intercept"),
+             prior(exponential(1),  class = "sd")))
+summary(m2)
+```
+
+## M3 -- M1 plus spatial covariates (sensitivity)
+
+Since the gears were fished at different places, add the spatial terms from the
+main model set to see whether the gear estimate moves.
+
+```{r m3}
+m3 <- fit_cached("m3_spatial",
+  n_l_75 ~ Gear + out30_z + Edge_Type + distance_m_z + distance_along_channel_z +
+           s(water_year_day, k = 5) + offset(log(Volume)) + (1 | StationCode),
+  data = paired)
+summary(m3)
+```
+
+# 4. The gear effect across models
+
+`Gear` is coded with Mamou as the reference, so `b_GearOtter` is the log rate
+ratio of Otter to Mamou at equal volume. Exponentiated, 1.0 means "no gear
+effect".
+
+```{r gear-effect}
+gear_rr <- function(fit, label) {
+  dr <- as_draws_df(fit)$b_GearOtter
+  tibble(model = label,
+         RR_median = median(exp(dr)),
+         RR_lo95   = quantile(exp(dr), 0.025),
+         RR_hi95   = quantile(exp(dr), 0.975),
+         P_Otter_gt_Mamou = mean(dr > 0))
+}
+
+bind_rows(
+  gear_rr(m1, "M1: out30 + edge +\n 1|site + s(day)"),
+  gear_rr(m2, "M2: out30 + edge +\n 1|week"),
+  gear_rr(m3, "M3: out30 + edge +\n dist_along + dist_off + 1|site + s(day)")
+) %>% mutate(across(where(is.numeric), ~round(.x, 3)))
+```
+
+
+
+# 5. Posterior predictive checks
+
+```{r ppc, fig.width=7, fig.height=3}
+pp_check(m1, type = "rootogram") + ggtitle("M1")
+pp_check(m2, type = "rootogram") + ggtitle("M2")
+```
+
+# 6. Summary figures
+
+```{r fig-setup, message=FALSE}
+library(patchwork)
+library(tidybayes)
+
+GEAR_COLS <- c(Mamou = "#2E6F9E", Otter = "#C1663A")   # colourblind-safe pair
+FIG <- "output_figs/gear_efficiency_mamou_vs_otter"
+
+# Axis titles and tick labels fixed at 8 pt (journal minimum). Panel titles and
+# subtitles are left larger on purpose -- they are reference text for writing
+# captions and get cropped out of the final supplemental figure.
+base_theme <- theme_classic(base_size = 8) +
+  theme(axis.title       = element_text(size = 8),
+        axis.text        = element_text(size = 8),
+        legend.text      = element_text(size = 8),   # matched to the axis text
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold", size = 8),
+        plot.title       = element_text(face = "bold", size = 10),
+        plot.subtitle    = element_text(size = 8, colour = "grey30"),
+        legend.position  = "top",
+        legend.title     = element_blank(),
+        legend.key.size  = unit(3, "mm"))
+theme_set(base_theme)
+```
+
+## Panel A -- sampling design
+
+Which weeks each gear was fished, and how many tows. Only weeks with both gears
+enter the analysis.
+
+```{r panel-a}
+wk_all <- tps %>%
+  filter(Gear %in% c("Mamou", "Otter"), water_year == 2019) %>%
+  count(yrwk, Gear) %>%
+  complete(yrwk, Gear, fill = list(n = 0)) %>%
+  group_by(yrwk) %>%
+  mutate(both = all(n > 0)) %>%
+  ungroup()
+
+pA <- ggplot(wk_all, aes(n, yrwk, fill = Gear)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(data = distinct(wk_all, yrwk, both) %>% filter(!both),
+            aes(x = max(wk_all$n) * 1.03, y = yrwk, label = "week excluded"),
+            inherit.aes = FALSE, hjust = 0, size = 2.3,
+            colour = "grey45", fontface = "italic") +
+  scale_fill_manual(values = GEAR_COLS) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.30))) +
+  labs(title = "A. Sampling design, WY2019",
+       subtitle = "Otter was fished only in WY2019;\n 8 of 13 weeks have both gears",
+       x = "Tows", y = NULL)
+pA
+```
+
+## Panel B -- raw CPUE, paired within week
+
+The within-week contrast M2 estimates, shown directly. Lines join the two gears
+in the same week.
+
+```{r panel-b}
+wk_cpue <- paired %>%
+  group_by(yrwk, Gear) %>%
+  summarise(cpue = sum(n_l_75) / sum(Volume) * 10000, tows = n(), .groups = "drop")
+
+pooled <- paired %>%
+  group_by(Gear) %>%
+  summarise(cpue = sum(n_l_75) / sum(Volume) * 10000, .groups = "drop")
+
+pB <- ggplot(wk_cpue, aes(Gear, cpue)) +
+  geom_line(aes(group = yrwk), colour = "grey70", linewidth = 0.4) +
+  geom_point(aes(colour = Gear, size = tows), alpha = 0.85) +
+  geom_point(data = pooled, aes(fill = Gear), shape = 23, size = 3.4,
+             colour = "black", stroke = 0.6, inherit.aes = TRUE) +
+  scale_colour_manual(values = GEAR_COLS, guide = "none") +
+  scale_fill_manual(values = GEAR_COLS, guide = "none") +
+  scale_size_continuous(range = c(1.4, 4), guide = "none") +
+  labs(title = "B. Raw CPUE paired by week",
+       subtitle = "Grey lines join the same week; point size = tows;\n diamonds = pooled CPUE",
+       x = NULL, y = expression("Catch < 75 mm per 10,000 m"^3))
+pB
+```
+
+## Panel C -- what else differs between the gears
+
+The confounding to keep in mind: no location was fished by both gears, so
+habitat and position differ systematically.
+
+```{r panel-c, fig.width=7, fig.height=3}
+edge_bal <- paired %>%
+  count(Gear, Edge_Type) %>%
+  group_by(Gear) %>% mutate(prop = n / sum(n)) %>% ungroup()
+
+pC1 <- ggplot(edge_bal, aes(prop, fct_rev(Edge_Type), fill = Gear)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = GEAR_COLS) +
+  scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "C. Covariate imbalance", subtitle = "Edge type",
+       x = "Share of tows", y = NULL)
+
+pC2 <- ggplot(paired, aes(DistanceAlongChannel / 1000, Gear, fill = Gear)) +
+  ggdist::stat_halfeye(adjust = 0.8, width = 0.7, .width = 0.5,
+                       point_size = 1.6, alpha = 0.85) +
+  scale_fill_manual(values = GEAR_COLS, guide = "none") +
+  labs(subtitle = "Position along channel", x = "Distance along channel (km)", y = NULL)
+
+pC <- pC1 / pC2 + plot_layout(heights = c(1.3, 1))
+pC
+```
+
+## Panel D -- the gear effect
+
+Posterior rate ratio, Otter relative to Mamou at equal towed volume.
+
+```{r panel-d}
+rr_draws <- bind_rows(
+  tibble(model = "M1: out30 + edge +\n 1|site + s(day)", rr = exp(as_draws_df(m1)$b_GearOtter)),
+  tibble(model = "M2: out30 + edge +\n 1|week",          rr = exp(as_draws_df(m2)$b_GearOtter)),
+  tibble(model = "M3: out30 + edge +\n dist_along + dist_off +\n 1|site + s(day)", rr = exp(as_draws_df(m3)$b_GearOtter))
+) %>% mutate(model = fct_rev(fct_inorder(model)))
+
+pD <- ggplot(rr_draws, aes(rr, model)) +
+  annotate("rect", xmin = 0.5, xmax = 2, ymin = -Inf, ymax = Inf,
+           fill = "grey90", alpha = 0.6) +
+  stat_halfeye(.width = c(0.5, 0.95), fill = "#7F9CB5", point_size = 1.8,
+               interval_size_range = c(0.5, 1.2)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "firebrick", linewidth = 0.5) +
+  scale_x_log10(breaks = c(0.1, 0.5, 1, 2, 4),        # 0.25 dropped: collides
+                labels = c("0.1", "0.5", "1", "2", "4")) +
+  coord_cartesian(xlim = c(0.08, 5)) +
+  labs(title = "D. Otter : Mamou catch rate ratio",
+       subtitle = "Dashed line = no gear effect;\n shaded band = within 2-fold",
+       x = "Rate ratio (log scale)", y = NULL)
+pD
+```
+
+## Panel E -- model-adjusted CPUE by gear
+
+Counterfactual standardisation: predict every tow in the paired set as if it had
+been fished with each gear, holding volume at 10,000 m^3, then average over the
+observed covariate distribution. This removes the Edge_Type / position imbalance
+that the raw CPUE in Panel B carries.
+
+```{r panel-e}
+adj_cpue <- function(fit, label) {
+  map_dfr(c("Mamou", "Otter"), function(g) {
+    nd <- paired %>% mutate(Gear = factor(g, levels = levels(paired$Gear)),
+                            Volume = 10000)
+    ep <- posterior_epred(fit, newdata = nd, re_formula = NA)   # draws x tows
+    tibble(model = label, Gear = g, cpue = rowMeans(ep))        # avg over tows
+  })
+}
+
+adj <- bind_rows(adj_cpue(m1, "M1"), adj_cpue(m2, "M2"), adj_cpue(m3, "M3")) %>%
+  mutate(Gear = factor(Gear, levels = c("Mamou", "Otter")))
+
+pE <- ggplot(adj, aes(cpue, model, fill = Gear)) +
+  stat_halfeye(.width = 0.95, point_size = 1.5, alpha = 0.8,
+               position = position_dodge(width = 0.5), slab_alpha = 0.7,
+               key_glyph = "rect") +   # match the bar panels so legends merge into one
+  scale_fill_manual(values = GEAR_COLS) +
+  coord_cartesian(xlim = c(0, 6)) +
+  labs(title = "E. Model-adjusted CPUE",
+       subtitle = expression("Predicted catch < 75 mm per 10,000 m"^3*" \n averaged over observed covariates"),
+       x = expression("Predicted CPUE per 10,000 m"^3*" (x-axis clipped at 6)"), y = NULL)
+pE
+```
+
+```{r adj-table}
+adj %>% group_by(model, Gear) %>%
+  summarise(median = median(cpue), lo95 = quantile(cpue, .025),
+            hi95 = quantile(cpue, .975), .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+```
+
+## Combined figure
+
+```{r combined, fig.width=9, fig.height=10}
+pC2b <- pC2 + labs(subtitle = "C2. Position along channel")
+# pE's halfeye keys are drawn with alpha, so ggplot won't merge them with the bar
+# panels' keys -- suppress the duplicate and let panel A's legend serve the figure.
+pEb  <- pE + guides(fill = "none")
+pC1b <- pC1 + labs(title = NULL, subtitle = "C1. Edge type")
+
+gear_fig <- (pA | pB) / (pC1b | pC2b) / (pD | pEb) +
+  plot_layout(heights = c(1.05, 0.8, 1), guides = "collect") &
+  theme(legend.position = "top")
+
+gear_fig <- gear_fig +
+  plot_annotation(
+    title = "Mamou vs Otter trawl efficiency, TPS WY2019",
+    subtitle = "Sub-75 mm Chinook catch, 161 tows across 8 weeks in which both gears were fished",
+    caption = "No location was fished by both gears: the design is paired in time, not in space.",
+    theme = theme(plot.title    = element_text(face = "bold", size = 12),
+                  plot.subtitle = element_text(size = 9, colour = "grey30"),
+                  plot.caption  = element_text(size = 7.5, colour = "grey40", hjust = 0))
+  )
+gear_fig
+```
+
+```{r save-figs}
+# ---- output geometry -------------------------------------------------------
+COL_MM  <- 84     # single-column max width (each panel, for the supplement)
+FULL_MM <- 174    # double-column width for the 2 x 3 combined figure; at this
+                  # width each sub-panel lands at ~87 mm, so the 8 pt type
+                  # renders at the same physical size as the standalone panels
+DPI     <- 600
+
+save_fig <- function(plot, file, width_mm, height_mm, preview = FALSE) {
+  ggsave(paste0(file, ".pdf"),  plot, device = "pdf",
+         width = width_mm, height = height_mm, units = "mm")
+  ggsave(paste0(file, ".tiff"), plot, device = "tiff", dpi = DPI,
+         compression = "lzw",
+         width = width_mm, height = height_mm, units = "mm")
+  if (preview)
+    ggsave(paste0(file, "_preview.png"), plot, device = "png", dpi = 150,
+           width = width_mm, height = height_mm, units = "mm")
+  invisible(file)
+}
+
+# combined multi-panel
+save_fig(gear_fig, FIG, FULL_MM, 200, preview = TRUE)
+
+# individual panels, all at the 84 mm column width; heights differ only because
+# the panels carry different numbers of categories
+panels <- list(
+  list(p = pA, suffix = "A_design",        h = 92),
+  list(p = pB, suffix = "B_raw_cpue",      h = 78),
+  list(p = pC, suffix = "C_balance",      h = 105),
+  list(p = pD, suffix = "D_rate_ratio",    h = 85),   # 3-line model labels
+  list(p = pE, suffix = "E_adjusted_cpue", h = 78)
+)
+
+walk(panels, ~ save_fig(.x$p, sprintf("%s_%s", FIG, .x$suffix),
+                        COL_MM, .x$h, preview = TRUE))
+
+list.files("output_figs", pattern = "gear_efficiency", full.names = TRUE)
+```
+
+# 7. (moved)
+
+The covariate correlation matrices are in `04_diagnostics/covariate_correlations_by_water_year.Rmd`.
+
+# 8. Gear comparison for FORK LENGTH
+
+Same question as section 3, different response: does gear type shift measured
+fork length once the other predictors are accounted for?
+
+Model structure follows `tidal-parr-forklength-analysis2_kfold.Rmd`
+(`build_fl_formula()`): `ForkLength ~ <fixef> + water_year_day_z +
+(1|StationCode)`, `gaussian()`, with `fl_priors`. Added covariates per request:
+outflow (`out30_z`), water depth (`start_depth_z`) and a week random intercept.
+
+One structural improvement over the catch models: fork length is measured **per
+fish**, and several fish share a tow, so `(1|StationCode)` is a genuine
+tow-level random effect here rather than the observation-level term it collapsed
+to in section 3.
+
+## 8.1 Paired subset
+
+```{r fl-data}
+fl <- read.csv("data/tps_forklength_data.csv") %>%
+  mutate(date = as.Date(SampleDate),
+         yrwk = paste0(year(date), "-W", sprintf("%02d", isoweek(date))))
+
+table(fl$Gear, fl$Water_Year)
+```
+
+Otter fork lengths exist only in WY2019, mirroring the catch data. Keep weeks in
+which **both gears produced measured fish** -- a week with only one gear cannot
+contribute to a within-week gear contrast.
+
+```{r fl-subset}
+fl_paired <- fl %>%
+  filter(Gear %in% c("Mamou", "Otter"), Water_Year == 2019) %>%
+  group_by(yrwk) %>% filter(n_distinct(Gear) == 2) %>% ungroup() %>%
+  mutate(Gear = factor(Gear, levels = c("Mamou", "Otter")),
+         yrwk = factor(yrwk))
+
+fl_paired %>% group_by(Gear) %>%
+  summarise(fish = n(), tows = n_distinct(StationCode),
+            mean_FL = mean(ForkLength), sd_FL = sd(ForkLength),
+            min = min(ForkLength), max = max(ForkLength), .groups = "drop")
+```
+
+The confounding is severe and worth seeing before any model runs:
+
+```{r fl-confound}
+# raw, all WY2019 fish (what a naive comparison would use)
+fl %>% filter(Gear %in% c("Mamou","Otter"), Water_Year == 2019) %>%
+  group_by(Gear) %>% summarise(n = n(), mean_FL = mean(ForkLength), .groups="drop")
+
+# per week, shared weeks only
+fl_paired %>% group_by(yrwk, Gear) %>%
+  summarise(n = n(), mean = mean(ForkLength), sd = sd(ForkLength), .groups = "drop") %>%
+  pivot_wider(names_from = Gear, values_from = c(n, mean, sd))
+
+# same fish, centred within week -- the week effect removed by subtraction
+fl_paired %>% group_by(yrwk) %>% mutate(fl_c = ForkLength - mean(ForkLength)) %>%
+  ungroup() %>% group_by(Gear) %>% summarise(mean_centred = mean(fl_c), .groups = "drop")
+```
+
+Across all WY2019 fish Mamou averages **66.2 mm** and Otter **48.9 mm** -- a
+17.3 mm gap. Restricting to shared weeks cuts it to 6.2 mm, and centring within
+week cuts it to **about 3.9 mm**. Almost the entire apparent gear difference is
+seasonal growth: Otter's fish are concentrated in W10-W16 while Mamou also fished
+W18-W22, by which time the fish are much larger. Any gear conclusion drawn
+without week control is measuring the calendar, not the net.
+
+## 8.2 Models
+
+```{r fl-models}
+fl_priors <- c(set_prior("normal(0,5)", class = "b"))   # from the kfold script
+
+fl_m1 <- fit_cached_fl("fl_m1_requested",
+  ForkLength ~ Gear + out30_z + start_depth_z + water_year_day_z + (1 | StationCode),
+  data = fl_paired)
+
+fl_m2 <- fit_cached_fl("fl_m2_within_week",
+  ForkLength ~ Gear + start_depth_z + (1 | yrwk) + (1 | StationCode),
+  data = fl_paired)
+
+fl_m3 <- fit_cached_fl("fl_m3_spatial",
+  ForkLength ~ Gear + out30_z + start_depth_z + distance_m_z +
+               distance_along_channel_z + water_year_day_z + (1 | StationCode),
+  data = fl_paired)
+
+summary(fl_m2)
+```
+
+## 8.3 A more informative model: does gear change the size *distribution*?
+
+**This is the part I would actually rely on.** A mean-only model asks whether
+one net catches bigger fish on average. That is not the question that matters
+for a fork-length analysis -- gear selectivity acts on the *shape* of the size
+distribution. A net with a larger mesh or a faster tow speed can return a mean
+close to the other net while systematically truncating one tail.
+
+The raw numbers already hint at this: within shared weeks the Mamou SD is
+19.6 mm against Otter's 14.1 mm, a 40% difference in spread against a ~4 mm
+difference in centre. A location-only model is blind to that.
+
+`fl_m4` models the residual SD as a function of gear as well as the mean, so
+`sigma_GearOtter` is the log ratio of Otter's size spread to Mamou's.
+
+```{r fl-m4}
+fl_m4 <- fit_cached_fl("fl_m4_distributional",
+  bf(ForkLength ~ Gear + start_depth_z + (1 | yrwk) + (1 | StationCode),
+     sigma      ~ Gear),
+  data   = fl_paired,
+  priors = c(set_prior("normal(0,5)", class = "b"),
+             set_prior("normal(0,1)", class = "b", dpar = "sigma")))
+
+summary(fl_m4)
+```
+
+## 8.4 Gear effect across models
+
+```{r fl-effects}
+fl_effect <- function(fit, label) {
+  d <- as_draws_df(fit)$b_GearOtter
+  tibble(model = label, median_mm = median(d),
+         lo95 = quantile(d, .025), hi95 = quantile(d, .975),
+         P_Otter_smaller = mean(d < 0))
+}
+
+bind_rows(
+  fl_effect(fl_m1, "M1 requested (out30 + depth + day)"),
+  fl_effect(fl_m2, "M2 within-week"),
+  fl_effect(fl_m3, "M3 + spatial"),
+  fl_effect(fl_m4, "M4 distributional (mean part)")
+) %>% mutate(across(where(is.numeric), ~round(.x, 2)))
+
+# scale effect: ratio of Otter SD to Mamou SD
+sig <- exp(as_draws_df(fl_m4)$b_sigma_GearOtter)
+tibble(quantity = "sigma ratio (Otter / Mamou)",
+       median = median(sig), lo95 = quantile(sig, .025),
+       hi95 = quantile(sig, .975), P_ratio_lt_1 = mean(sig < 1)) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+```
+
+A distribution-free check on the same question, with the week effect removed by
+centring:
+
+```{r fl-ks}
+cw <- fl_paired %>% group_by(yrwk) %>%
+  mutate(fl_c = ForkLength - mean(ForkLength)) %>% ungroup()
+suppressWarnings(
+  ks.test(cw$fl_c[cw$Gear == "Mamou"], cw$fl_c[cw$Gear == "Otter"])
+)
+```
+
+## 8.5 Figures
+
+```{r fl-panels}
+FLFIG <- "output_figs/gear_forklength_mamou_vs_otter"
+
+# A. design: measured fish per week per gear
+fl_wk <- fl %>% filter(Gear %in% c("Mamou","Otter"), Water_Year == 2019) %>%
+  count(yrwk, Gear) %>% complete(yrwk, Gear, fill = list(n = 0)) %>%
+  group_by(yrwk) %>% mutate(both = all(n > 0)) %>% ungroup()
+
+fA <- ggplot(fl_wk, aes(n, yrwk, fill = Gear)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(data = distinct(fl_wk, yrwk, both) %>% filter(!both),
+            aes(x = max(fl_wk$n) * 1.03, y = yrwk, label = "no paired catch"),
+            inherit.aes = FALSE, hjust = 0, size = 2.3, colour = "grey45",
+            fontface = "italic") +
+  scale_fill_manual(values = GEAR_COLS) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.38))) +
+  labs(title = "A. Measured fish per week", x = "Fish measured", y = NULL,
+       subtitle = "Excluded = one gear caught no fish (it may still have been fished)")
+
+# B. the confounding: fish grow through the season
+fB <- ggplot(filter(fl, Gear %in% c("Mamou","Otter"), Water_Year == 2019),
+             aes(date, ForkLength, colour = Gear)) +
+  geom_point(alpha = 0.75, size = 1.1) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.5) +
+  scale_colour_manual(values = GEAR_COLS) +
+  labs(title = "B. Season, not gear", x = "Sample date", y = "Fork length (mm)",
+       subtitle = "Otter's fish are early-season; Mamou also fished W18-W22")
+
+# C. within-week centred distributions -- the selectivity question
+cw <- fl_paired %>% group_by(yrwk) %>%
+  mutate(fl_c = ForkLength - mean(ForkLength)) %>% ungroup()
+
+fC <- ggplot(cw, aes(fl_c, colour = Gear)) +
+  stat_ecdf(linewidth = 0.7) +
+  scale_colour_manual(values = GEAR_COLS) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50", linewidth = 0.4) +
+  labs(title = "C. Size distribution, week removed",
+       subtitle = "ECDF of fork length centred within week",
+       x = "Fork length - week mean (mm)", y = "Cumulative proportion")
+
+# D. mean gear effect across models
+fl_rr <- bind_rows(
+  tibble(model = "M1 requested",     d = as_draws_df(fl_m1)$b_GearOtter),
+  tibble(model = "M2 within-week",   d = as_draws_df(fl_m2)$b_GearOtter),
+  tibble(model = "M3 + spatial",     d = as_draws_df(fl_m3)$b_GearOtter),
+  tibble(model = "M4 distributional",d = as_draws_df(fl_m4)$b_GearOtter)
+) %>% mutate(model = fct_rev(fct_inorder(model)))
+
+fD <- ggplot(fl_rr, aes(d, model)) +
+  stat_halfeye(.width = c(0.5, 0.95), fill = "#7F9CB5", point_size = 1.6,
+               interval_size_range = c(0.5, 1.2)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "firebrick", linewidth = 0.5) +
+  labs(title = "D. Mean fork-length difference",
+       subtitle = "Otter minus Mamou; dashed line = no gear effect",
+       x = "Difference (mm)", y = NULL)
+
+# E. scale effect -- the part a mean-only model cannot see
+fE <- tibble(ratio = exp(as_draws_df(fl_m4)$b_sigma_GearOtter)) %>%
+  ggplot(aes(ratio, "")) +
+  stat_halfeye(.width = c(0.5, 0.95), fill = "#B58F7F", point_size = 1.6,
+               interval_size_range = c(0.5, 1.2)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "firebrick", linewidth = 0.5) +
+  labs(title = "E. Size-spread ratio (M4)",
+       subtitle = "Otter SD / Mamou SD; < 1 = Otter returns a narrower size range",
+       x = "sigma ratio", y = NULL)
+```
+
+```{r fl-combined, fig.width=6.85, fig.height=7.9}
+# B and C carry colour scales whose keys won't merge with A's fill keys, so the
+# collected strip would show the gear legend three times; A's serves the figure.
+fBb <- fB + guides(colour = "none")
+fCb <- fC + guides(colour = "none")
+
+fl_fig <- (fA | fBb) / (fCb | fD) / fE +
+  plot_layout(heights = c(1, 1, 0.7), guides = "collect") &
+  theme(legend.position = "top")
+
+fl_fig <- fl_fig + plot_annotation(
+  title = "Mamou vs Otter: fork length, TPS WY2019",
+  subtitle = "75 measured fish across 5 weeks in which both gears caught fish",
+  caption = "Mean fork length differs by 17.3 mm across all WY2019 fish; within week the difference is ~4 mm.",
+  theme = theme(plot.title = element_text(face = "bold", size = 12),
+                plot.subtitle = element_text(size = 9, colour = "grey30"),
+                plot.caption = element_text(size = 7.5, colour = "grey40", hjust = 0)))
+fl_fig
+```
+
+```{r fl-save}
+save_fig(fl_fig, FLFIG, FULL_MM, 200, preview = TRUE)
+
+fl_panels <- list(
+  list(p = fA, suffix = "A_design",       h = 78),
+  list(p = fB, suffix = "B_season",       h = 78),
+  list(p = fC, suffix = "C_ecdf",         h = 78),
+  list(p = fD, suffix = "D_mean_effect",  h = 78),
+  list(p = fE, suffix = "E_sigma_ratio",  h = 60)
+)
+walk(fl_panels, ~ save_fig(.x$p, sprintf("%s_%s", FLFIG, .x$suffix),
+                           COL_MM, .x$h, preview = TRUE))
+list.files("output_figs", pattern = "gear_forklength", full.names = TRUE)
+```

@@ -1,0 +1,387 @@
+---
+title: "TPS fork-length models (fits 1-19, leave-one-station-out CV)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 03 — TPS fork-length models (main text).**
+>
+> **Purpose.** Fit the 19 gaussian fork-length models (`fit_tps_fl_1` … `fit_tps_fl_19`) with a
+> `(1 | StationCode)` intercept and score them with leave-one-station-out (K = 69) grouped
+> cross-validation.
+>
+> **Inputs.** `data/tps_forklength_data.csv` (built by `00_data/01_build_model_datasets.Rmd`).
+>
+> **Outputs.** `fits_tps_fl_kfold/fit_tps_fl_<N>.rds`, K-fold sidecars `kfold69_tps_fl_<N>.rds`,
+> `fits_tps_fl_kfold/fit_tps_fl_kfold69_comparisons.csv`.
+>
+> **Cost.** Long (69 refits per model); fitting chunks are `eval=FALSE`.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+Fork-length analogue of `02_edsm_catch_models/edsm_catch_kfold_models.Rmd`. We fit every fork-length model
+`fit_tps_fl_1` .. `fit_tps_fl_19` (gaussian, with a `(1|StationCode)` random intercept) and score
+them with grouped (by StationCode) K-fold CV instead of PSIS-LOO. Folds are grouped on StationCode
+because that is the random-intercept variable. Unlike the trawl notebook this starts from scratch:
+we generate and cache the fold set ourselves rather than recovering it from previously fit models.
+
+K choice: there are 69 stations, so K = 69 is leave-one-station-out (LOSO); K = 10 is much faster.
+Every Edge_Type level spans >= 5 stations, so LOSO is always safe for the Edge_Type models; the
+fold builder checks factor-level coverage and warns if a smaller K ever splits a level into one fold.
+
+```{r}
+library(tidyverse)
+library(brms)
+library(rstan)
+library(loo)
+library(future)
+
+options(mc.cores = parallel::detectCores())
+```
+
+Config — set the number of grouped-by-station folds here (single source of truth).
+```{r}
+K_FOLDS  <- 69   # 69 = leave-one-station-out (safest); set to 10 for a much faster run
+FIT_DIR  <- "fits_tps_fl_kfold"
+if (!dir.exists(FIT_DIR)) dir.create(FIT_DIR, recursive = TRUE)
+```
+
+Load fork-length dataset (ready to go — no further wrangling needed).
+```{r}
+d_fl <- read_csv("data/tps_forklength_data.csv")
+d_fl$Edge_Type   <- factor(d_fl$Edge_Type)     # 5-level factor predictor
+d_fl$StationCode <- factor(d_fl$StationCode)   # 69 grouping levels
+```
+
+Prior (same as the source fork-length analysis).
+```{r}
+fl_priors <- c(set_prior("normal(0,5)", class = "b"))
+```
+
+
+###################################
+Station-level K-fold helper.
+The fold assignment is supplied as a precomputed vector (`folds`) so that EVERY model is scored
+on the exact same partition of stations — this is what makes the K-fold comparison valid.
+Settings: gaussian, iter = 4000 / warmup = 2000 (2000 draws), adapt_delta = 0.95
+(diagnostic-checked: 0 divergences, Rhat <= 1.02 on both the base and full-covariate models).
+########################################
+```{r}
+add_station_kfold <- function(
+  fit,
+  folds,
+  K,
+  group   = "StationCode",
+  chains  = 4,
+  cores   = 4,
+  iter    = 4000,
+  warmup  = 2000,
+  control = list(max_treedepth = 10, adapt_delta = 0.95),
+  seed    = 123,
+  save_fits = FALSE
+) {
+  stopifnot(length(folds) == nrow(fit$data))
+  set.seed(seed)
+
+  kf <- brms::kfold(
+    fit,
+    folds   = folds,        # custom fold vector -> identical partition for every model
+    compare = FALSE,
+    save_fits = save_fits,
+    chains  = chains,
+    cores   = cores,
+    iter    = iter,
+    warmup  = warmup,
+    control = control
+  )
+
+  # Stored under e.g. "kfold69_StationCode" so the comparison code can find it.
+  fit$criteria[[paste0("kfold", K, "_", group)]] <- kf
+  fit
+}
+```
+
+
+###################################
+Fold-partition builder.
+Creates the grouped-by-StationCode fold vector ONCE for a given K, caches it to disk, and checks
+that no factor level (Edge_Type) lands entirely in a single fold (which would break kfold for the
+models that use it). Returns an integer fold id (1..K) per row, aligned to `data` row order.
+########################################
+```{r}
+# Warn if any factor level appears in only one fold (training would then lack that level).
+check_factor_coverage <- function(data, folds, factors = "Edge_Type") {
+  for (f in intersect(factors, names(data))) {
+    n_folds_with_level <- rowSums(table(level = data[[f]], fold = folds) > 0)
+    bad <- names(which(n_folds_with_level < 2))
+    if (length(bad)) {
+      warning("Factor '", f, "' level(s) {", paste(bad, collapse = ", "),
+              "} appear in only one fold -> kfold will fail for models using '", f,
+              "'. Use a larger K (K = 69 / LOSO is always safe here) or a different seed.")
+    } else {
+      message("Factor '", f, "' coverage OK (every level spans >= 2 folds).")
+    }
+  }
+}
+
+make_station_folds <- function(data, K, group = "StationCode",
+                               factors = "Edge_Type", seed = 123, dir = FIT_DIR) {
+  file <- file.path(dir, sprintf("kfold%d_station_folds.rds", K))
+  if (file.exists(file)) {
+    folds <- readRDS(file)
+  } else {
+    set.seed(seed)
+    folds <- as.integer(loo::kfold_split_grouped(K = K, x = factor(data[[group]])))
+    stopifnot(length(folds) == nrow(data))
+    if (!dir.exists(dir)) dir.create(dir, recursive = TRUE)
+    saveRDS(folds, file)
+  }
+  check_factor_coverage(data, folds, factors)
+  folds
+}
+```
+
+
+###################################
+Model definition table + runner.
+`fit_defs` lists the fixed-effects part of each model (fit 1..19), transcribed from
+`tidal-parr-forklength-analysis2.rmd`. The base model appended to each is:
+  ForkLength ~ <fixef> + water_year_day_z + (1|StationCode)
+########################################
+```{r}
+# Fixed-effects part of each model ("" = base model: water_year_day_z + intercept only).
+fit_defs <- tibble::tribble(
+  ~num, ~fixef,
+  1L,   "",
+  2L,   "distance_along_channel_z + distance_m_z + start_depth_z",
+  3L,   "distance_m_z + start_depth_z",
+  4L,   "distance_along_channel_z + start_depth_z",
+  5L,   "distance_along_channel_z + distance_m_z",
+  6L,   "distance_along_channel_z",
+  7L,   "distance_m_z",
+  8L,   "start_depth_z",
+  9L,   "distance_along_channel_z + distance_m_z + start_depth_z + out30_z",
+  10L,  "distance_along_channel_z + distance_m_z + start_depth_z + Edge_Type",
+  11L,  "distance_along_channel_z + distance_m_z + start_depth_z + Edge_Type + out30_z",
+  12L,  "distance_m_z + start_depth_z + out30_z",
+  13L,  "distance_m_z + start_depth_z + out30_z + Edge_Type",
+  14L,  "Edge_Type",
+  15L,  "distance_along_channel_z + Edge_Type",
+  16L,  "distance_m_z + Edge_Type",
+  17L,  "start_depth_z + Edge_Type",
+  18L,  "distance_m_z + start_depth_z + Edge_Type",
+  19L,  "distance_along_channel_z + distance_m_z + Edge_Type"
+)
+
+# Build the full brms formula for a given fixed-effects string.
+build_fl_formula <- function(fixef) {
+  rhs <- c(fixef, "water_year_day_z", "(1|StationCode)")
+  rhs <- rhs[nzchar(trimws(rhs))]          # drop empty fixef (base model)
+  as.formula(paste("ForkLength ~", paste(rhs, collapse = " + ")))
+}
+
+# Fit ONE model, run station K-fold on the cached folds, save the fit + a lightweight kfold
+# sidecar (the part needed for ELPD ranking / ensemble weights), append the summary, free memory.
+# save_pars(all = FALSE) keeps b_*, sd_StationCode, sigma and r_StationCode -> enough for
+# conditional effects, CIs, and beta forest plots; only the moment-matching extras are dropped.
+fit_fl_model <- function(num, fixef, folds, K,
+                         data    = d_fl,
+                         priors  = fl_priors,
+                         iter    = 4000,
+                         warmup  = 2000,
+                         chains  = 4,
+                         control = list(max_treedepth = 10, adapt_delta = 0.95),
+                         dir     = FIT_DIR) {
+  form <- build_fl_formula(fixef)
+  message("=== Fitting fit_tps_fl_", num, " ===")
+  print(form)
+
+  fit <- brm(
+    formula = form,
+    family  = gaussian(),
+    data    = data,
+    prior   = priors,
+    iter    = iter, warmup = warmup, chains = chains,
+    control = control,
+    save_pars = save_pars(all = FALSE)
+  )
+
+  fit <- add_station_kfold(
+    fit = fit, folds = folds, K = K,
+    chains = chains, iter = iter, warmup = warmup, control = control
+  )
+
+  # Full fit (posterior draws -> conditional effects / CIs / forest plots)
+  saveRDS(fit, file = file.path(dir, sprintf("fit_tps_fl_%d.rds", num)))
+  # Lightweight kfold criterion (ELPD -> ranking / ensemble weights) without loading the big fit
+  saveRDS(fit$criteria[[paste0("kfold", K, "_StationCode")]],
+          file = file.path(dir, sprintf("kfold%d_tps_fl_%d.rds", K, num)))
+
+  # Printout to the designated txt file
+  fileConn <- file(file.path(dir, "fit_tps_fl_output.txt"), open = "a")
+  cat(sprintf("\n\n\nSummary of fit_tps_fl_%d:\n\n", num), file = fileConn)
+  cat(capture.output(summary(fit)), file = fileConn, sep = "\n")
+  close(fileConn)
+
+  rm(fit); gc()
+  invisible(NULL)
+}
+
+# Loop over a set of fit numbers (default: all 19).
+run_fl_fits <- function(nums = fit_defs$num, K = K_FOLDS, defs = fit_defs,
+                        folds = station_folds, ...) {
+  unknown <- setdiff(nums, defs$num)
+  if (length(unknown)) {
+    stop("No fixed-effects definition for fit number(s): ", paste(unknown, collapse = ", "))
+  }
+  for (num in nums) {
+    fixef <- defs$fixef[match(num, defs$num)]
+    fit_fl_model(num = num, fixef = fixef, folds = folds, K = K, ...)
+  }
+  invisible(NULL)
+}
+```
+
+
+###################################
+Core-aware parallelism (same approach as the trawl notebook).
+Folds are parallelized across `workers`; each fold still runs `chains` chains, and we never
+oversubscribe: workers = floor(cores / chains). chains stays 4 on every machine.
+########################################
+```{r}
+kfold_workers <- function(chains = 4) {
+  nc <- parallel::detectCores()
+  if (is.na(nc)) nc <- 1L
+  max(1L, nc %/% chains)
+}
+
+# Set the future plan brms::kfold uses to dispatch folds. Call once before running.
+# Pass workers = 1 to force sequential if nested parallelism misbehaves on macOS.
+setup_kfold_plan <- function(chains = 4, workers = NULL) {
+  library(future)
+  options(future.globals.maxSize = 3 * 1024^3)
+  if (is.null(workers)) workers <- kfold_workers(chains)
+  if (workers >= 2L) plan(multisession, workers = workers) else plan(sequential)
+  message(sprintf("Cores: %s | chains/fold: %d | fold-workers: %d (%s)",
+                  parallel::detectCores(), chains, workers,
+                  if (workers >= 2L) "folds run in parallel" else "folds run sequentially"))
+  invisible(workers)
+}
+```
+
+
+###################################
+Runtime check (optional).
+Times a short pilot fit on the real model + data, then extrapolates to one full fit + K-fold and
+to the whole batch. Defaults to K = 69 (LOSO). Auto-detects cores so the estimate reflects how
+`setup_kfold_plan()` will actually run. Does NOT run a full fit.
+########################################
+```{r eval=FALSE}
+estimate_fl_time <- function(fixef       = "distance_m_z + start_depth_z",
+                             nW          = 500L, nDraw = 250L,    # pilot iters
+                             prod_warmup = 2000, prod_sample = 2000,
+                             K = 69, chains = 4, n_models = 19,
+                             workers = NULL,
+                             data = d_fl, priors = fl_priors) {
+  if (is.null(workers)) workers <- kfold_workers(chains)
+
+  pilot <- brm(
+    build_fl_formula(fixef),
+    family = gaussian(), data = data, prior = priors,
+    chains = 1, warmup = nW, iter = nW + nDraw,
+    control = list(max_treedepth = 10, adapt_delta = 0.95),
+    refresh = 0, seed = 1
+  )
+
+  et     <- rstan::get_elapsed_time(pilot$fit)         # per-chain warmup / sample seconds
+  Tchain <- (et[1, "warmup"] / nW)   * prod_warmup +   # extrapolate to production iters
+            (et[1, "sample"] / nDraw) * prod_sample
+  waves      <- ceiling(K / workers)                   # k-fold runs in this many sequential waves
+  kfold_wall <- waves * ((K - 1) / K) * Tchain         # each fold trains on ~ (K-1)/K of the rows
+  per_model  <- Tchain + kfold_wall                    # main fit (chains in parallel) + k-fold
+
+  cat(sprintf("cores=%s  chains=%d  fold-workers=%d  K=%d  ->  %d k-fold wave(s)\n",
+              parallel::detectCores(), chains, workers, K, waves))
+  cat(sprintf("single full fit : %5.1f min\n", Tchain / 60))
+  cat(sprintf("one model       : %5.1f min  (%.2f h)\n", per_model / 60, per_model / 3600))
+  cat(sprintf("%2d models        : %5.1f h\n", n_models, n_models * per_model / 3600))
+  invisible(per_model)
+}
+
+estimate_fl_time(K = 69)    # leave-one-station-out
+estimate_fl_time(K = 10)    # the faster alternative
+```
+
+
+###################################
+Build / cache the fold set for the chosen K.
+########################################
+```{r}
+station_folds <- make_station_folds(d_fl, K = K_FOLDS)
+table(station_folds)
+```
+
+
+###################################
+Run the fits.
+Each fit + K-fold is slow at K = 69; run this interactively, not on knit.
+########################################
+```{r eval=FALSE}
+# Auto-detect cores and parallelize folds (8 cores -> 2 at a time; 4 cores -> sequential).
+setup_kfold_plan(chains = 4)
+
+station_folds <- make_station_folds(d_fl, K = K_FOLDS)
+
+# Run all 19 (or pass a subset, e.g. run_fl_fits(c(1, 9, 11))).
+run_fl_fits(nums = 1:19, K = K_FOLDS)
+```
+
+
+###################################
+Reload K-fold results and rank models by ELPD.
+Reads the lightweight kfold sidecars (fast — no need to load the full fits), runs loo_compare,
+and writes the ranking. Re-run any time after more fits finish.
+########################################
+```{r eval=FALSE}
+fit_nums <- 1:19
+
+kfold_results <- list()
+for (num in fit_nums) {
+  f <- file.path(FIT_DIR, sprintf("kfold%d_tps_fl_%d.rds", K_FOLDS, num))
+  if (file.exists(f)) {
+    kfold_results[[paste0("fit_tps_fl_", num)]] <- readRDS(f)
+  }
+}
+
+if (length(kfold_results) < 2) {
+  stop("Need at least two fits with K = ", K_FOLDS, " kfold results to compare.")
+}
+
+# ELPD comparison ranking (best model on top, elpd_diff relative to it)
+kfold_comparisons_fl <- loo_compare(kfold_results)
+print(kfold_comparisons_fl)
+
+write.csv(
+  as.data.frame(kfold_comparisons_fl),
+  file.path(FIT_DIR, sprintf("fit_tps_fl_kfold%d_comparisons.csv", K_FOLDS))
+)
+
+# Optional: model weights for ensemble graphing (pseudo-BMA+ from the same kfold elpds)
+# w <- loo_model_weights(kfold_results, method = "pseudobma")
+# saveRDS(w, file.path(FIT_DIR, sprintf("fit_tps_fl_kfold%d_weights.rds", K_FOLDS)))
+```

@@ -1,0 +1,251 @@
+---
+title: "Effort and catch summary table"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 05 — effort / catch summary table.**
+>
+> **Purpose.** Rebuilds the survey × water-year effort and catch table directly from the combined
+> tow file (EDSM and TPS, WY2017–2021, December–June).
+>
+> **Input.** `data/All_Surveys_Combined_v7.3.csv`. **Output.** `output_figs/pub_table_tows_all.csv`.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+Reproduces `output_figs/pub_table_tows_all.csv` (survey x water-year effort/catch
+summary) directly from `data/All_Surveys_Combined_v7.3.csv`.
+
+Scope: EDSM and TPS only, water years 2017-2021, months December-June (the
+Dec-Jun parr-migration window used throughout the analysis -- this is what makes
+the EDSM tow counts match the published table).
+
+```{r setup, message=FALSE}
+library(tidyverse)
+```
+
+Load data. The file has a UTF-8 BOM, so the first column name comes in as
+`ï..Survey` / `﻿Survey` depending on the reader; fix it explicitly.
+
+```{r load}
+all_surveys <- read.csv("data/All_Surveys_Combined_v7.3.csv",
+                        stringsAsFactors = FALSE)
+names(all_surveys)[1] <- "Survey"
+
+dim(all_surveys)
+```
+
+Filter to the surveys, water years, and months of interest.
+
+```{r filter}
+migration_months <- c(12, 1, 2, 3, 4, 5, 6)
+
+tows <- all_surveys %>%
+  filter(Survey %in% c("EDSM", "TPS"),
+         Water_Year >= 2017, Water_Year <= 2021,
+         Month %in% migration_months) %>%
+  # n_l_75 is NA when no fish were measured; those tows caught no <75 mm fish
+  mutate(n_l_75 = replace_na(n_l_75, 0))
+
+tows %>% count(Survey, Water_Year)
+```
+
+Summarise. CPUE is pooled over the whole water year -- sum of catch divided by
+sum of volume -- and scaled by 10,000 (fish per 10,000 m^3), which is the scale
+used in the published table. Detections are tows with nonzero
+`Chinook_Salmon_Catch` **or** nonzero `n_l_75`.
+
+For TPS there is one row per StationCode, so Sites == Tows. For EDSM each site
+was towed several times, so Sites counts distinct StationCodes and Tows counts
+rows.
+
+```{r summarise}
+cpue_scale <- 10000
+
+# One place that defines every metric, so single-year rows and multi-year
+# rollups are guaranteed to be computed identically. CPUE is always
+# sum(catch) / sum(Volume) over whatever rows are passed in -- never an
+# average of per-year CPUEs.
+summarise_tows <- function(df) {
+  df %>%
+    summarise(
+      Sites               = n_distinct(StationCode),
+      Tows                = n(),
+      Detections          = sum(Chinook_Salmon_Catch > 0 | n_l_75 > 0),
+      `Total Catch`       = sum(Chinook_Salmon_Catch),
+      CPUE                = sum(Chinook_Salmon_Catch) / sum(Volume) * cpue_scale,
+      `Detections < 75mm` = sum(n_l_75 > 0),
+      `Catch < 75mm`      = sum(n_l_75),
+      `CPUE < 75mm`       = sum(n_l_75) / sum(Volume) * cpue_scale,
+      .groups = "drop"
+    )
+}
+
+by_year <- tows %>%
+  group_by(Survey, Water_Year) %>%
+  summarise_tows() %>%
+  transmute(Survey, water_year = as.character(Water_Year),
+            row_type = "year", across(Sites:`CPUE < 75mm`))
+
+by_year
+```
+
+### Multi-year rollup rows
+
+Pooled across the years in each range: catch and Volume are summed over all
+tows in the range *first*, then divided -- so these CPUEs are volume-weighted
+totals, not averages of the yearly CPUEs shown above.
+
+Edit `rollup_spec` to change which ranges get a row.
+
+```{r rollups}
+# TPS ran 2018-2021; EDSM ran 2017-2021. First two rows cover the years the two
+# surveys overlap (2018-2021) so they are directly comparable; the third adds
+# EDSM's extra 2017 season for its full-span total.
+rollup_spec <- tibble::tribble(
+  ~Survey, ~year_from, ~year_to,
+  "TPS",         2018,     2021,
+  "EDSM",        2018,     2021,
+  "EDSM",        2017,     2021
+)
+
+rollups <- rollup_spec %>%
+  purrr::pmap_dfr(function(Survey, year_from, year_to) {
+    tows %>%
+      filter(Survey == !!Survey,
+             Water_Year >= year_from, Water_Year <= year_to) %>%
+      summarise_tows() %>%
+      transmute(Survey = !!Survey,
+                water_year = paste0(year_from, "-", year_to),
+                row_type = "multi-year", across(Sites:`CPUE < 75mm`))
+  })
+
+rollups
+```
+
+Sanity check: the count columns in a rollup should equal the sum of the
+per-year rows it covers, while CPUE should *not* equal the mean of the yearly
+CPUEs (it is volume-weighted).
+
+```{r rollup-check}
+purrr::pmap_dfr(rollup_spec, function(Survey, year_from, year_to) {
+  yrs <- by_year %>%
+    filter(Survey == !!Survey, water_year %in% as.character(year_from:year_to))
+  rol <- rollups %>%
+    filter(Survey == !!Survey, water_year == paste0(year_from, "-", year_to))
+  tibble::tibble(
+    Survey = Survey, range = paste0(year_from, "-", year_to),
+    tows_match   = sum(yrs$Tows)  == rol$Tows,
+    sites_match  = sum(yrs$Sites) == rol$Sites,
+    catch_match  = sum(yrs$`Total Catch`) == rol$`Total Catch`,
+    det_match    = sum(yrs$Detections) == rol$Detections,
+    pooled_CPUE  = rol$CPUE,
+    mean_of_yrly = mean(yrs$CPUE)
+  )
+})
+```
+
+Combine, placing each survey's rollup rows directly beneath its yearly rows.
+
+```{r combine}
+pub_table <- bind_rows(by_year, rollups) %>%
+  arrange(factor(Survey, levels = c("TPS", "EDSM")),
+          factor(row_type, levels = c("year", "multi-year")),
+          water_year)
+
+pub_table
+```
+
+Compare against the original file.
+
+```{r compare}
+orig <- read.csv("output_figs/pub_table_tows_all.csv", check.names = FALSE)
+
+check <- orig %>%
+  rename_with(~ paste0(.x, "_orig"), -c(Survey, water_year)) %>%
+  mutate(water_year = as.character(water_year)) %>%
+  left_join(filter(pub_table, row_type == "year"), by = c("Survey", "water_year"))
+
+# absolute difference in every numeric column
+check %>%
+  transmute(Survey, water_year,
+            d_Sites      = Sites      - Sites_orig,
+            d_Tows       = Tows       - Tows_orig,
+            d_Det        = Detections - Detections_orig,
+            d_Catch      = `Total Catch` - `Total Catch_orig`,
+            d_CPUE       = CPUE       - CPUE_orig,
+            d_Det75      = `Detections < 75mm` - `Detections < 75mm_orig`,
+            d_Catch75    = `Catch < 75mm` - `Catch < 75mm_orig`,
+            d_CPUE75     = `CPUE < 75mm` - `CPUE < 75mm_orig`)
+```
+
+Everything reproduces exactly except EDSM site counts in WY2017 (123 here vs 124
+published) and WY2018 (194 here vs 193 published). Tow counts, catch, detections
+and all CPUE values match to full printed precision in every year, and no
+alternative site definition tried (lat/long pairs, StationCode x Region,
+StationCode x lat/long) changes those two numbers -- so this looks like drift
+between the data version used for the original table and v7.3, not a difference
+in how sites are counted.
+
+## Units check: is `Volume` in m^3 or ft^3?
+
+Worth confirming, since CPUE is reported per 10,000 volume units. Nothing in the
+project converts tow `Volume` between cfs/cms -- every `0.0283168` in the repo
+applies to `OUT` / `OUT_Moving_Mean_30d` (Dayflow Delta outflow), never to
+`Volume`. EDSM volumes are cubic meters per the EDI metadata (edi.415).
+
+For TPS, back-calculate the net mouth area from the raw survey file: tow volume
+divided by flowmeter distance should recover a constant per net type, and that
+constant is diagnostic of the units.
+
+```{r units-check}
+tps_raw <- read.csv("data/tps_bug_allspp_data.csv") %>%
+  distinct(site_id, .keep_all = TRUE)
+
+tps_raw %>%
+  mutate(mouth_area = fish_tow_volume / flowmeter_distance) %>%
+  group_by(fish_net) %>%
+  summarise(n = sum(!is.na(mouth_area)),
+            area_if_m2  = round(median(mouth_area, na.rm = TRUE), 3),
+            # what the same number would mean if volume were ft^3 (1 ft^2 = 0.092903 m^2)
+            area_if_ft2 = round(median(mouth_area, na.rm = TRUE) * 0.092903, 3),
+            .groups = "drop")
+```
+
+The ratio is an exact constant within each net type: Kodiak 16.72, Otter 6.541,
+Mamou 6.057, Tenera 4.459.
+
+The Otter row settles it. The CDFW Bay Study otter trawl has a documented mouth
+opening of 1.5 m x 4.3 m = **6.45 m^2**, and the back-calculated constant is
+6.541 -- a 1.4% match against a rounded published spec. If `Volume` were cubic
+feet the same constant would imply a 0.61 m^2 mouth, an order of magnitude too
+small. TPS `Volume` is therefore in **cubic meters**, same as EDSM.
+
+Consistent with this, TPS and EDSM Kodiak tows are the same order of magnitude
+(median 7,750 vs 4,002 m^3); a ft^3/m^3 mixup would put them ~35x apart.
+
+**Conclusion: no unit conversion is needed.** Both surveys report `Volume` in
+m^3, and CPUE in the table is fish per 10,000 m^3.
+
+Write out under a new name so the original is preserved.
+
+```{r write}
+out_path <- "output_figs/pub_table_tows_all_v7.3_rebuild.csv"
+write.csv(pub_table, out_path, row.names = FALSE)
+out_path
+```

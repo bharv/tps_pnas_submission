@@ -1,0 +1,400 @@
+---
+title: "EDSM catch models (fits 0-21, grouped 5-fold CV by station)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 02 — EDSM catch models (main text).**
+>
+> **Purpose.** Fit the 22 EDSM negative-binomial catch models (`fit_edsm_0` … `fit_edsm_21`),
+> each with a `(1 | StationCode)` random intercept, and score them with grouped 5-fold
+> cross-validation on a single, cached station partition so every model is compared on
+> identical folds.
+>
+> **Inputs.** `data/tow_12_6_edsm_wq_nona.csv`; the cached fold vector
+> `fits_edsm_Vfix/kfold5_station_folds.rds` (rebuilt from a completed fit if absent).
+>
+> **Outputs.** `fits_edsm_Vfix/fit_edsm_<N>.rds`, `fits_edsm_Vfix/edsm_fits_Vfix_output.txt`,
+> the small criteria bundle `fits_edsm_Vfix/kfold5_station_criteria_bundle.rds`, and
+> `fits_edsm_Vfix/fit_edsm_topmods_catch_kfold5_station_comparisons.csv`.
+>
+> **Cost.** ~1–2 h per model including K-fold (6 extra fits each); all fitting chunks are
+> `eval=FALSE`.
+>
+> **Appendix.** Salinity / temperature fits 22–26 and the water-year diagnostic fit 27 re-use
+> the runner defined here; see `appendix_salinity_temperature_wateryear/A04_*.R`.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+```{r libraries}
+library(tidyverse)
+library(brms)
+library(rstan)
+library(DHARMa)
+library(lubridate)
+
+options(mc.cores = parallel::detectCores())
+```
+
+Load the EDSM model dataset (4,241 tows; built by `00_data/01_build_model_datasets.Rmd`).
+```{r load-data}
+tow_12_6_edsm_wq_nona <- read_csv("data/tow_12_6_edsm_wq_nona.csv")
+```
+
+
+EDSM CATCH U75 with 1|StationCode random intercept
+Realized should probably have station as grouping factor because of multi-tow for EDSM.
+We refit every model `fit_edsm_0` .. `fit_edsm_21` adding `+ (1|StationCode)` and evaluate
+them with grouped (by StationCode) K-fold CV (K = 5) instead of PSIS-LOO, because there are
+too many high-leverage points for moment matching (computation takes too long).
+```{r priors}
+catch_priors <- c(prior(normal(0,2.5), class = "b"),
+                  prior(gamma(2, 0.1), class = "shape"),
+                  prior(normal(-5.5, 2), class = "Intercept"),
+                  prior(normal(20, 5), class = "sds"))
+```
+
+
+###################################
+Station-level K-fold helper.
+The fold assignment is supplied as a precomputed vector (`folds`) so that EVERY model is scored
+on the exact same partition of stations. This is what makes the K-fold model comparison valid.
+########################################
+```{r kfold-helper}
+# Station-level K-fold cross-validation for brms models.
+# `folds` must be an integer vector of length nrow(fit$data) giving the fold id (1..K)
+# of each observation. Passing folds directly (rather than folds = "grouped") guarantees an
+# identical partition across all fits, regardless of RNG state.
+add_station_kfold <- function(
+  fit,
+  folds,
+  K = 5,
+  group = "StationCode",
+  chains = 4,
+  cores = 4,
+  iter = 3000,
+  warmup = 2000,
+  control = list(max_treedepth = 12, adapt_delta = 0.99),
+  seed = 123,
+  save_fits = FALSE
+) {
+  stopifnot(length(folds) == nrow(fit$data))
+  set.seed(seed)
+
+  kf <- brms::kfold(
+    fit,
+    folds = folds,        # custom fold vector -> identical partition for every model
+    compare = FALSE,
+    save_fits = save_fits,
+    chains = chains,
+    cores = cores,
+    iter = iter,
+    warmup = warmup,
+    control = control
+  )
+
+  # Stored under "kfold5_StationCode" to match the existing comparison code.
+  fit$criteria[[paste0("kfold", K, "_", group)]] <- kf
+
+  return(fit)
+}
+```
+
+
+###################################
+Canonical fold set.
+Build the K = 5 grouped-by-StationCode fold vector ONCE and cache it to disk so every model
+(including the appendix fits) is scored on the *exact* same folds. The folds are taken straight from a completed fit's stored
+kfold object, so they are guaranteed identical; we also confirm seed 123 reproduces them.
+########################################
+```{r station-folds}
+fold_rds <- "fits_edsm_Vfix/kfold5_station_folds.rds"
+
+if (file.exists(fold_rds)) {
+  station_folds <- readRDS(fold_rds)
+} else {
+  # One-time build (loads one ~190 MB fit). The "folds" attribute on a completed kfold object
+  # IS the partition that was actually used, so this is the authoritative fold set.
+  f_done <- readRDS("fits_edsm_Vfix/fit_edsm_8.rds")
+  station_folds <- as.integer(attr(f_done$criteria[["kfold5_StationCode"]], "folds"))
+  rm(f_done); gc()
+
+  # Confirm that the seed used in the wrapper reproduces this exact assignment.
+  set.seed(123)
+  folds_seed <- as.integer(
+    loo::kfold_split_grouped(K = 5, x = factor(tow_12_6_edsm_wq_nona$StationCode))
+  )
+  if (isTRUE(all.equal(station_folds, folds_seed))) {
+    message("Seed 123 reproduces the stored fold assignment exactly.")
+  } else {
+    message("NOTE: seed 123 did NOT reproduce stored folds; ",
+            "saving the stored (authoritative) folds used by the completed fits.")
+  }
+
+  stopifnot(length(station_folds) == nrow(tow_12_6_edsm_wq_nona))
+  saveRDS(station_folds, fold_rds)
+}
+
+# Sanity check
+table(station_folds)
+```
+
+
+###################################
+Model definition table + runner.
+`fit_defs` lists the fixed-effects portion of every model (fit 0..21), transcribed from the
+original no-intercept formulas so this notebook no longer depends on those fits. The base model
+appended to each is:
+  n_l_75 ~ <fixef> + s(water_year_day) + offset(log(Volume)) + (1|StationCode)
+########################################
+```{r fit-defs-runner}
+# Fixed-effects part of each model. "" = null model (smooth + offset + intercept only).
+fit_defs <- tibble::tribble(
+  ~num, ~fixef,
+  0L,   "",
+  1L,   "out30_z",
+  2L,   "out30_z + distance_along_channel_z",
+  3L,   "out30_z + distance_m_z",
+  4L,   "out30_z + distance_along_channel_z + distance_m_z",
+  5L,   "out30_z * distance_along_channel_z",
+  6L,   "out30_z * distance_m_z",
+  7L,   "out30_z * distance_along_channel_z + distance_m_z",
+  8L,   "out30_z * distance_m_z + distance_along_channel_z",
+  9L,   "out30_z * (distance_m_z + distance_along_channel_z)",
+  10L,  "out30_z * (distance_m_z + distance_along_channel_z) + secchi_z",
+  11L,  "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020 + secchi_z",
+  12L,  "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020 + dox_z",
+  13L,  "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020 + secchi_z + dox_z",
+  14L,  "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020",
+  15L,  "out30_z * (distance_m_z + distance_along_channel_z) + dox_z",
+  16L,  "out30_z * (distance_m_z + distance_along_channel_z) + secchi_z + dox_z",
+  17L,  "out30_z + secchi_z",
+  18L,  "out30_z + distance_m_z + secchi_z",
+  19L,  "out30_z + distance_along_channel_z + secchi_z",
+  20L,  "out30_z * distance_m_z + secchi_z",
+  21L,  "out30_z * distance_along_channel_z + secchi_z"
+)
+# Salinity / temperature fits 22-26 and the water-year diagnostic fit 27 are defined and run
+# in appendix_salinity_temperature_wateryear/A04_edsm_salinity_temperature_wateryear_fits.R.
+
+# Build the full brms formula for a given fixed-effects string.
+build_station_formula <- function(fixef) {
+  rhs <- c(fixef, "s(water_year_day)", "offset(log(Volume))", "(1|StationCode)")
+  rhs <- rhs[nzchar(trimws(rhs))]          # drop empty fixef (null model)
+  as.formula(paste("n_l_75 ~", paste(rhs, collapse = " + ")))
+}
+
+# Fit ONE model with the (1|StationCode) intercept, run station K-fold on the cached folds,
+# save the fit, append its summary to the printout file, then free memory.
+fit_station_model <- function(num, fixef, folds,
+                              data    = tow_12_6_edsm_wq_nona,
+                              priors  = catch_priors,
+                              iter    = 3000,
+                              warmup  = 2000,
+                              chains  = 4,
+                              control = list(max_treedepth = 12, adapt_delta = 0.99)) {
+  form <- build_station_formula(fixef)
+  message("=== Fitting fit_edsm_", num, " ===")
+  print(form)
+
+  fit <- brm(
+    formula = form,
+    family  = negbinomial(link = "log"),
+    data    = data,
+    prior   = priors,
+    iter    = iter, warmup = warmup, chains = chains,
+    control = control,
+    # all = FALSE: k-fold (unlike the old moment-matching) doesn't need the auxiliary
+    # draws, so we drop the z_1/zs_* blocks. group = TRUE (default) keeps the per-station
+    # r_StationCode draws that DHARMa and station-level plots rely on.
+    save_pars = save_pars(all = FALSE)
+  )
+
+  fit <- add_station_kfold(
+    fit = fit, folds = folds,
+    chains = chains, iter = iter, warmup = warmup, control = control
+  )
+
+  saveRDS(fit, file = sprintf("fits_edsm_Vfix/fit_edsm_%d.rds", num))
+
+  # Keep the printout exactly as before -> same designated txt file.
+  fileConn <- file("fits_edsm_Vfix/edsm_fits_Vfix_output.txt", open = "a")
+  cat(sprintf("\n\n\nSummary of fit_edsm_%d:\n\n", num), file = fileConn)
+  cat(capture.output(summary(fit)), file = fileConn, sep = "\n")
+  close(fileConn)
+
+  rm(fit); gc()
+  invisible(NULL)
+}
+
+# Loop over a set of fit numbers (e.g. the ones not yet rerun with the intercept).
+run_station_fits <- function(nums, defs = fit_defs, folds = station_folds, ...) {
+  unknown <- setdiff(nums, defs$num)
+  if (length(unknown)) {
+    stop("No fixed-effects definition for fit number(s): ", paste(unknown, collapse = ", "))
+  }
+  for (num in nums) {
+    fixef <- defs$fixef[match(num, defs$num)]
+    fit_station_model(num = num, fixef = fixef, folds = folds, ...)
+  }
+  invisible(NULL)
+}
+
+# --- core-aware k-fold parallelism -------------------------------------------------
+# Folds are parallelized across `workers`; each fold still runs `chains` chains. We never
+# oversubscribe: workers = floor(cores / chains). With chains = 4 that gives 2 fold-workers
+# on the 8-core machine and 1 (= sequential) on the 4-core machine -- no edits needed per box.
+kfold_workers <- function(chains = 4) {
+  nc <- parallel::detectCores()
+  if (is.na(nc)) nc <- 1L
+  max(1L, nc %/% chains)
+}
+
+# Set the future plan that brms::kfold uses to dispatch folds. Call this once before running.
+# Pass workers = 1 to force sequential (e.g. if nested parallelism misbehaves on macOS).
+setup_kfold_plan <- function(chains = 4, workers = NULL) {
+  library(future)
+  options(future.globals.maxSize = 3 * 1024^3)
+  if (is.null(workers)) workers <- kfold_workers(chains)
+  if (workers >= 2L) plan(multisession, workers = workers) else plan(sequential)
+  message(sprintf("Cores: %s | chains/fold: %d | fold-workers: %d (%s)",
+                  parallel::detectCores(), chains, workers,
+                  if (workers >= 2L) "folds run in parallel" else "folds run sequentially"))
+  invisible(workers)
+}
+```
+
+
+###################################
+Runtime check (optional).
+Times a short pilot fit on the real model + data, then extrapolates to one full fit + K-fold and
+to a batch of models. Auto-detects cores so the estimate matches how `setup_kfold_plan()` will run
+(8 cores -> 2 folds at a time; 4 cores -> sequential). Does NOT run a full fit.
+########################################
+```{r runtime-check, eval=FALSE}
+estimate_fit_time <- function(fixef       = "out30_z + secchi_z",
+                              nW          = 250L, nDraw = 200L,   # pilot iters
+                              prod_warmup = 2000, prod_sample = 1000,
+                              K = 5, chains = 4, n_models = 15,
+                              workers = NULL,
+                              data = tow_12_6_edsm_wq_nona, priors = catch_priors) {
+  if (is.null(workers)) workers <- kfold_workers(chains)
+
+  # Short pilot on the real model structure -- the costly bits (1005-level RE + smooth) are shared
+  # by every model, so a simple fixed-effects set is representative for timing.
+  pilot <- brm(
+    build_station_formula(fixef),
+    family = negbinomial("log"), data = data, prior = priors,
+    chains = 1, warmup = nW, iter = nW + nDraw,
+    control = list(max_treedepth = 12, adapt_delta = 0.99),
+    refresh = 0, seed = 1
+  )
+
+  et     <- rstan::get_elapsed_time(pilot$fit)          # per-chain warmup / sample seconds
+  Tchain <- (et[1, "warmup"] / nW)   * prod_warmup +    # extrapolate to production iters
+            (et[1, "sample"] / nDraw) * prod_sample
+  waves      <- ceiling(K / workers)                    # k-fold runs in this many sequential waves
+  kfold_wall <- waves * ((K - 1) / K) * Tchain          # each fold trains on ~ (K-1)/K of the rows
+  per_model  <- Tchain + kfold_wall                     # main fit (chains in parallel) + k-fold
+
+  cat(sprintf("cores=%s  chains=%d  fold-workers=%d  ->  %d k-fold wave(s)\n",
+              parallel::detectCores(), chains, workers, waves))
+  cat(sprintf("single full fit : %4.1f min\n", Tchain / 60))
+  cat(sprintf("one model       : %4.1f min  (%.2f h)\n", per_model / 60, per_model / 3600))
+  cat(sprintf("%2d models        : %4.1f h\n", n_models, n_models * per_model / 3600))
+  invisible(per_model)
+}
+
+estimate_fit_time()                          # k = 5 on whichever machine you're on
+# estimate_fit_time(K = 10, n_models = 3)    # what k = 10 on the top few models would cost
+```
+
+
+###################################
+Run the models.
+Each fit + K-fold is slow (~1-2 h per model); run this interactively, not on knit.
+NOTE: fit_station_model() writes fits_edsm_Vfix/fit_edsm_<N>.rds unconditionally, so only run
+the numbers you actually intend to (re)fit.
+########################################
+```{r run-fits, eval=FALSE}
+# Auto-detect cores and parallelize k-fold folds accordingly: 8 cores -> 2 folds at a time,
+# 4 cores -> sequential. chains stays 4 either way. Use setup_kfold_plan(workers = 1) to force
+# sequential if nested parallelism misbehaves on macOS.
+setup_kfold_plan(chains = 4)
+
+# Make sure the cached folds are loaded (the canonical-fold-set chunk above creates them).
+station_folds <- readRDS("fits_edsm_Vfix/kfold5_station_folds.rds")
+
+# The reported set is fits 0-21:
+run_station_fits(0:21)
+```
+
+
+###################################
+Harvest K-fold criteria into one small bundle (run ONCE; re-run only after adding/refitting models).
+Loads each big fit one at a time, extracts ONLY its stored K-fold criterion, drops the fit from
+memory (rm + gc), and saves the collected criteria as a single small RDS (a few MB). After this you
+never reload the multi-GB fits for a comparison again — and it's immune to iCloud eviction because
+the bundle stays small. tryCatch skips any unreadable/evicted fit with a warning instead of aborting.
+########################################
+```{r harvest-bundle, eval=FALSE}
+fit_nums       <- 0:21                 # any subset that has been run is fine
+criterion_name <- "kfold5_StationCode"
+bundle_path    <- "fits_edsm_Vfix/kfold5_station_criteria_bundle.rds"
+
+kfold_bundle <- list()
+for (n in fit_nums) {
+  fpath <- sprintf("fits_edsm_Vfix/fit_edsm_%d.rds", n)
+  if (!file.exists(fpath)) next
+  nm <- paste0("fit_edsm_", n)
+  crit <- tryCatch({
+    fit <- readRDS(fpath)                          # one big fit in memory...
+    out <- fit$criteria[[criterion_name]]          # ...keep only the K-fold criterion
+    rm(fit); gc()                                  # ...drop it before the next one
+    if (is.null(out)) warning(nm, " has no '", criterion_name, "' criterion")
+    out
+  }, error = function(e) { warning(nm, ": ", conditionMessage(e)); NULL })
+  if (!is.null(crit)) kfold_bundle[[nm]] <- crit
+}
+
+if (!dir.exists("fits_edsm_Vfix")) dir.create("fits_edsm_Vfix")
+saveRDS(kfold_bundle, bundle_path)
+cat("bundled", length(kfold_bundle), "of", length(fit_nums), "fits ->", bundle_path, "\n")
+```
+
+
+###################################
+K-fold model comparison from the bundle (fast, re-runnable, never touches the big fits).
+########################################
+```{r compare-kfold, eval=FALSE}
+bundle_path  <- "fits_edsm_Vfix/kfold5_station_criteria_bundle.rds"
+kfold_bundle <- Filter(Negate(is.null), readRDS(bundle_path))
+
+if (length(kfold_bundle) < 2) {
+  stop("Need at least two fits in the bundle to compare; re-run the harvest chunk.")
+}
+
+# ELPD comparison ranking (best model on top, elpd_diff relative to it)
+kfold_comparisons_catch_u75 <- loo_compare(kfold_bundle)
+print(kfold_comparisons_catch_u75)
+
+write.csv(
+  as.data.frame(kfold_comparisons_catch_u75),
+  "fits_edsm_Vfix/fit_edsm_topmods_catch_kfold5_station_comparisons.csv"
+)
+```

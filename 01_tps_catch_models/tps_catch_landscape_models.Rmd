@@ -1,0 +1,303 @@
+---
+title: "TPS catch models: landscape set (fits 1-10, PSIS-LOO)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 01 — TPS landscape catch models (supporting model set).**
+>
+> **Purpose.** Fit the 10 landscape-only TPS catch models (outflow and the two distance terms,
+> no water quality) on the larger no-water-quality dataset, score with moment-matched PSIS-LOO,
+> and write LOO sidecars + the ranking used by `05_figures/model_comparison_forest.Rmd`.
+>
+> **Inputs.** `data/tow_12_6_tps_nona.csv`.
+>
+> **Outputs.** `fits_tps_landscape/fit_tps<N>.rds`, slim LOO sidecars `loo_tps<N>.rds`,
+> `fits_tps_landscape/fit_tps_landscape1-10_catch_loo_comparisons.csv`.
+>
+> **Cost.** Several minutes per model; fitting chunk is `eval=FALSE`.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+Landscape (TPS) analogue of `02_edsm_catch_models/edsm_catch_kfold_models.Rmd`, but this analysis stays with
+PSIS-LOO + moment matching rather than grouped K-fold CV: each row of `tow_12_6_tps_nona` is an
+independent tow sample (there is no `(1|StationCode)` grouping here), so leave-one-observation-out
+is the correct cross-validation unit.
+
+The code is functionalised the same way as the EDSM/fork-length k-fold notebooks:
+  * one `fit_defs` table describes every model (fit 1..10),
+  * one runner fits the model, computes moment-matched LOO, saves the full fit AND a lightweight
+    LOO sidecar, and appends the summary to the shared text file,
+  * the ELPD comparison + stacking weights at the end read only the small LOO sidecars, so model
+    comparison/plotting never reloads the multi-GB fits.
+
+This is its OWN fit set on its OWN dataset (`tow_12_6_tps_nona`, no water-quality covariates),
+written to its OWN directory. It is NOT comparable, ELPD-for-ELPD, with the EDSM `tps_wq` k-fold
+set: those use a different dataset that was z-scored independently, so the scales differ. The only
+reason the sampler settings and the predictor/dispersion priors (b, shape) are matched across the
+three notebooks is methodological consistency — so any difference in inference reflects the data,
+not how the models were fit. The intercept and smooth-SD priors are left at brms defaults because
+they live on each dataset's own scale (see the Priors chunk).
+
+Settings (iter = 3000 / warmup = 2000, max_treedepth = 12, adapt_delta = 0.99, negbinomial,
+offset(log(Volume))) mirror the EDSM k-fold notebook. Unlike the k-fold notebooks,
+`save_pars(all = TRUE)` is kept here because moment matching needs the auxiliary draws.
+
+```{r}
+library(tidyverse)
+library(brms)
+library(rstan)
+library(loo)
+library(DHARMa)
+
+options(mc.cores = parallel::detectCores())
+```
+
+Config — single source of truth for paths.
+New, dedicated directory: these landscape fits are a separate fit set on a separate dataset
+(no WQ covariates) and must NOT be mixed with the EDSM `fits_tps_wq_Vfix` outputs.
+```{r}
+FIT_DIR <- "fits_tps_landscape"
+OUT_TXT <- file.path(FIT_DIR, "tps_landscape_fits_output.txt")   # appended printout
+if (!dir.exists(FIT_DIR)) dir.create(FIT_DIR, recursive = TRUE)
+```
+
+Load TPS landscape dataset (one independent tow per row).
+```{r}
+tow_12_6_tps_nona <- read_csv("data/tow_12_6_tps_nona.csv")
+```
+
+
+###################################
+Priors.
+Methodological consistency across the three notebooks means matching prior *informativeness*,
+NOT literal numbers (the datasets are z-scored independently, so no direct ELPD comparison).
+  * b       normal(0, 2.5) — on the common z-scored predictor scale, so IDENTICAL to EDSM is
+                             correct. Tested estimates (-0.9..1.8) sit comfortably inside.
+  * shape   gamma(2, 0.1)  — negbinomial dispersion; same scale, kept identical to EDSM.
+  * Intercept + sds        — LEFT AT brms DEFAULTS (student_t(3, -10.3, 2.5) and
+                             student_t(3, 0, 2.5)). These parameters live on THIS dataset's own
+                             scale: EDSM's normal(-5.5, 2) intercept sits ~3.4 SD from this
+                             dataset's posterior (~-12), and normal(20, 5) on sds would inflate
+                             the smooth (data supports sds ~1-5, model-dependent). The defaults
+                             are weakly informative and auto-scaled, so they keep the same "let
+                             the data speak" stance as the k-fold notebooks without mis-centering.
+Diagnostics on the null model and the most-complex model both showed 0 divergences, 0 treedepth
+saturation, E-BFMI ~0.9-1.1, max Rhat <= 1.005 -> clean posterior exploration.
+########################################
+```{r}
+catch_priors <- c(prior(normal(0, 2.5), class = "b"),
+                  prior(gamma(2, 0.1),  class = "shape"))
+```
+
+
+###################################
+LOO helper.
+Computes PSIS-LOO with `save_psis = TRUE`, then moment-matches it (loo_moment_match needs the
+full posterior, hence save_pars(all = TRUE) on the fit) and stores it on the fit under
+`fit$criteria$loo`, exactly as the original notebook did.
+########################################
+```{r}
+add_loo_mm <- function(fit, moment_match = TRUE, cores = parallel::detectCores()) {
+  loo_result <- loo(fit, save_psis = TRUE, cores = cores)
+  if (moment_match) {
+    loo_result <- loo_moment_match(fit, loo = loo_result, cores = cores)
+  }
+  fit$criteria$loo <- loo_result
+  fit
+}
+
+# Slim a loo object down to what loo_compare() / loo_model_weights() actually use
+# (estimates + pointwise). The psis_object holds the full 4000 x N log-lik/weights matrix
+# (~27 MB) and is NOT needed for ranking or stacking. Dropping it turns the "lightweight"
+# sidecar from ~25 MB into ~60 KB, which matters here because large .rds files in this
+# iCloud-synced folder get evicted and then fail to read mid-batch ("error reading from
+# connection"). The full loo (with psis_object) still lives inside the big fit's $criteria$loo.
+slim_loo <- function(loo_obj) {
+  loo_obj$psis_object <- NULL
+  loo_obj
+}
+
+# Robust readRDS for this iCloud-synced folder. If a file has been evicted to the cloud, the
+# first read can fail ("error reading from connection"); we force macOS to materialize it
+# (brctl download, then fault the bytes in with a full read) and retry a few times.
+read_rds_icloud <- function(f, tries = 4) {
+  for (i in seq_len(tries)) {
+    obj <- tryCatch(readRDS(f), error = function(e) e)
+    if (!inherits(obj, "error")) return(obj)
+    try(system2("brctl", c("download", shQuote(f)), stdout = FALSE, stderr = FALSE), silent = TRUE)
+    invisible(tryCatch(readBin(f, "raw", file.info(f)$size), error = function(e) NULL))  # fault in
+    Sys.sleep(1.5)
+  }
+  stop("could not read ", f, " after ", tries, " tries (iCloud eviction?).")
+}
+
+# Load the slim LOO sidecars for a set of fit numbers into a named list.
+load_loo_sidecars <- function(nums, dir = FIT_DIR) {
+  out <- list()
+  for (num in nums) {
+    f <- file.path(dir, sprintf("loo_tps%d.rds", num))
+    if (file.exists(f)) out[[paste0("fit_tps", num)]] <- read_rds_icloud(f)
+  }
+  out
+}
+```
+
+
+###################################
+Model definition table + runner.
+`fit_defs` lists the fixed-effects part of each model (fit 1..10), transcribed from the original
+hand-written chunks. The base model appended to each is:
+  n_l_75 ~ <fixef> + s(water_year_day) + offset(log(Volume))
+########################################
+```{r}
+# Fixed-effects part of each model ("" = null model: smooth + offset + intercept only).
+fit_defs <- tibble::tribble(
+  ~num, ~fixef,
+  1L,   "",
+  2L,   "out30_z",
+  3L,   "out30_z + distance_along_channel_z",
+  4L,   "out30_z + distance_m_z",
+  5L,   "out30_z + distance_along_channel_z + distance_m_z",
+  6L,   "out30_z * distance_along_channel_z",
+  7L,   "out30_z * distance_m_z",
+  8L,   "out30_z * distance_along_channel_z + distance_m_z",
+  9L,   "out30_z * distance_m_z + distance_along_channel_z",
+  10L,  "out30_z * (distance_along_channel_z + distance_m_z)"
+)
+
+# Build the full brms formula for a given fixed-effects string.
+build_tps_formula <- function(fixef) {
+  rhs <- c(fixef, "s(water_year_day)", "offset(log(Volume))")
+  rhs <- rhs[nzchar(trimws(rhs))]          # drop empty fixef (null model)
+  as.formula(paste("n_l_75 ~", paste(rhs, collapse = " + ")))
+}
+
+# Fit ONE model, compute moment-matched LOO, save the full fit + a lightweight LOO sidecar
+# (the part needed for ELPD ranking / stacking weights), append the summary, free memory.
+# save_pars(all = TRUE): unlike the k-fold notebooks, moment matching needs the auxiliary draws.
+fit_tps_model <- function(num, fixef,
+                          data    = tow_12_6_tps_nona,
+                          priors  = catch_priors,
+                          iter    = 3000,
+                          warmup  = 2000,
+                          chains  = 4,
+                          control = list(max_treedepth = 12, adapt_delta = 0.99),
+                          dir     = FIT_DIR,
+                          out_txt = OUT_TXT) {
+  form <- build_tps_formula(fixef)
+  message("=== Fitting fit_tps", num, " ===")
+  print(form)
+
+  fit <- brm(
+    formula = form,
+    family  = negbinomial(link = "log"),
+    data    = data,
+    prior   = priors,
+    iter    = iter, warmup = warmup, chains = chains,
+    control = control,
+    save_pars = save_pars(all = TRUE)
+  )
+
+  fit <- add_loo_mm(fit)
+
+  # Full fit (posterior draws -> conditional effects / CIs / forest plots)
+  saveRDS(fit, file = file.path(dir, sprintf("fit_tps%d.rds", num)))
+  # Lightweight LOO criterion (ELPD -> ranking / stacking weights) without loading the big fit.
+  # Slimmed (psis_object dropped) -> ~60 KB, so it is not evicted by iCloud like the big fits.
+  saveRDS(slim_loo(fit$criteria$loo), file = file.path(dir, sprintf("loo_tps%d.rds", num)))
+
+  # Append the summary to the shared printout file (same file as before).
+  fileConn <- file(out_txt, open = "a")
+  cat(sprintf("\n\n\nSummary of fit_tps%d:\n\n", num), file = fileConn)
+  cat(capture.output(summary(fit)), file = fileConn, sep = "\n")
+  close(fileConn)
+
+  rm(fit); gc()
+  invisible(NULL)
+}
+
+# Loop over a set of fit numbers (default: all 10).
+run_tps_fits <- function(nums = fit_defs$num, defs = fit_defs, ...) {
+  unknown <- setdiff(nums, defs$num)
+  if (length(unknown)) {
+    stop("No fixed-effects definition for fit number(s): ", paste(unknown, collapse = ", "))
+  }
+  for (num in nums) {
+    fixef <- defs$fixef[match(num, defs$num)]
+    fit_tps_model(num = num, fixef = fixef, ...)
+  }
+  invisible(NULL)
+}
+```
+
+
+###################################
+Run the fits.
+Each fit + moment-matched LOO is slow; run this interactively, not on knit.
+########################################
+```{r eval=FALSE}
+# Run all 10 (or pass a subset, e.g. run_tps_fits(c(1, 5, 10))).
+run_tps_fits(nums = 1:10)
+```
+
+
+###################################
+Reload LOO results and rank models by ELPD.
+Reads the lightweight LOO sidecars (fast — no need to load the full fits), runs loo_compare,
+and writes the ranking. Re-run any time after more fits finish.
+########################################
+```{r eval=FALSE}
+fit_nums <- 1:10
+
+loo_results <- load_loo_sidecars(fit_nums)
+
+if (length(loo_results) < 2) {
+  stop("Need at least two fits with LOO results to compare; run the fits first.")
+}
+
+# ELPD comparison ranking (best model on top, elpd_diff relative to it)
+loo_comparisons_catch_tps <- loo_compare(loo_results)
+print(loo_comparisons_catch_tps)
+
+write.csv(
+  as.data.frame(loo_comparisons_catch_tps),
+  file.path(FIT_DIR, "fit_tps_landscape1-10_catch_loo_comparisons.csv")
+)
+```
+
+
+###################################
+Model stacking weights.
+Stacking weights (Yao et al. 2018) from the same moment-matched LOO objects — for model-averaged
+predictions / ensemble graphing. Saved as a sidecar so the ensemble code never reloads the fits.
+########################################
+```{r eval=FALSE}
+fit_nums <- 1:10
+
+loo_results <- load_loo_sidecars(fit_nums)
+
+# Stacking weights (default LOO-based optimal predictive stacking)
+stacking_weights_tps <- loo_model_weights(loo_results, method = "stacking")
+print(stacking_weights_tps)
+saveRDS(stacking_weights_tps, file.path(FIT_DIR, "fit_tps_landscape1-10_catch_stacking_weights.rds"))
+
+# Optional: pseudo-BMA+ weights for comparison
+# pbma_weights_tps <- loo_model_weights(loo_results, method = "pseudobma")
+# print(pbma_weights_tps)
+```

@@ -1,0 +1,2587 @@
+---
+title: "Main-text ensemble figures (cache-backed)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 05 — main-text ensemble figures (stacked-model effects).**
+>
+> **Purpose.** Builds the stacking-weighted ensemble figures: combined TPS + EDSM catch
+> conditional effects (original units), the TPS/EDSM "butterfly" coefficient forest (alt4,
+> annotated; alt5, clean), and the fork-length coefficient forest (alt90) and conditional effects.
+>
+> **How it stays fast.** A guarded chunk (`build-or-load-cache`) streams every fit once
+> (load → extract the posterior `b_*` draws, the predictive criterion and the ensemble
+> conditional-effects grid → free) into `cache/fast_figure_cache_kfold.rds`. After that every
+> render reads only the cache (~1 min). Set `force_rebuild <- TRUE` in `setup` after refitting.
+>
+> **Inputs.** fits from steps 01–03 (cache build only); model CSVs for back-transforming z-scores.
+> **Outputs.** `output_figs/combined_TPS_EDSM_*`, `output_figs/TPS_FL_*` (PDF vector + 600 dpi
+> LZW TIFF + PNG preview).
+>
+> The salinity-included appendix versions are produced by
+> `appendix_salinity_temperature_wateryear/A07_salinity_ensemble_figures.R`, which re-uses the
+> function chunks defined here.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+Streamlined, cache-backed version of the project's full ensemble notebook (not needed here). It produces ONLY
+five figures and never re-reads whole brms fits on a normal render.
+
+A one-time guarded chunk streams every fit **one at a time** (load → extract the
+small pieces → free), and saves the small bits each figure needs to
+`cache/fast_figure_cache_kfold.rds`:
+
+  • per-fit `b_*` posterior draws + predictive criteria (for the butterfly and
+    fork-length forest figures);
+  • the precomputed ensemble conditional-effects data (the only fit-touching figure
+    step) for the catch and fork-length conditional-effects figures.
+
+After the cache exists, every render reads it and runs in seconds — no fit is ever
+loaded. Set `force_rebuild <- TRUE` to refresh after refitting models or after
+changing which covariates are plotted (the cached CE is tied to the selected set).
+
+Figures produced:
+  1. Catch conditional effects, original-scale x (combined TPS + EDSM, cms / units)
+  2. Butterfly forest ALT4 (one-column, journal-sized; weight-shaded slabs + annotations)
+  3. Butterfly forest ALT5 (annotation-free clean variant; taller curves, black median hashes)
+  4. Fork-length beta forest (centered + right label layouts)
+  5. Fork-length conditional effects, original-scale x (freed water-year-day y-axis)
+
+```{r setup}
+library(brms)
+library(loo)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(tibble)      # tribble()
+library(posterior)
+library(ggdist)
+library(marquee)     # element_marquee(): renders **bold** in axis labels.
+# NOTE: ggtext::element_markdown() does NOT work here — ggplot2 4.x moved theme elements
+# to S7 and ggtext 0.1.2's element is silently ignored (tags print literally).  marquee
+# only works when the theme's ROOT text element is marquee-ised too, hence
+# marquefy_theme(theme_minimal(...)) in the figure functions below.
+
+# TRUE = re-stream all fits and rebuild the cache (~20 min). FALSE = fast render
+# from the saved cache.
+force_rebuild <- FALSE
+cache_path    <- "cache/fast_figure_cache_kfold.rds"
+```
+
+LOAD RAW DATA (for z -> original-unit back-transforms only)
+```{r raw-data}
+tow_12_6_tps_wq_nona  <- read.csv("data/tow_12_6_tps_wq_nona.csv",  stringsAsFactors = FALSE)
+tow_12_6_edsm_wq_nona <- read.csv("data/tow_12_6_edsm_wq_nona.csv", stringsAsFactors = FALSE)
+```
+
+FIT REGISTRY (paths only — no fits are loaded here)
+```{r fit-registry}
+# EDSM catch: 22 station-intercept k-fold models, referenced by path; kfold criteria
+# are pre-bundled (tiny, no fits touched).
+edsm_nums            <- 0:21
+fit_names_edsm_catch <- paste0("fit_edsm_catch", edsm_nums)
+fit_paths_edsm       <- setNames(paste0("fits_edsm_Vfix/fit_edsm_", edsm_nums, ".rds"),
+                                 fit_names_edsm_catch)
+edsm_kfold_bundle <- readRDS("fits_edsm_Vfix/kfold5_station_criteria_bundle.rds")
+edsm_criteria     <- setNames(edsm_kfold_bundle[paste0("fit_edsm_", edsm_nums)],
+                              fit_names_edsm_catch)
+stopifnot(!any(vapply(edsm_criteria, is.null, logical(1))))
+
+# TPS catch: 14 models (path-only; streamed during the cache build, not pre-loaded).
+tps_nums            <- 0:13
+fit_names_tps_catch <- paste0("fit_tps_catch", tps_nums)
+fit_paths_tps       <- setNames(paste0("fits_tps_wq_Vfix/fit_tps_wq", tps_nums, ".rds"),
+                                fit_names_tps_catch)
+
+# TPS fork length: 19 k-fold models (path-only; streamed during the cache build).
+fit_names_tps_fl <- paste0("fit_tps_fl_", 1:19)
+fit_paths_tps_fl <- setNames(paste0("fits_tps_fl_kfold/fit_tps_fl_", 1:19, ".rds"),
+                             fit_names_tps_fl)
+
+# Combined registry for streaming consumers (covers both catch surveys).
+fit_paths_all <- c(fit_paths_tps, fit_paths_edsm)
+
+# Shared exclusion patterns for the fork-length sections.
+fl_patterns_to_exclude <- c(
+  "lprior", "lp_", "swater_year_day", "zs_1_1",
+  ".iteration", ".draw", ".chain",
+  "^sigma$", "^shape$", "^Intercept$", "^b_Intercept$"
+)
+```
+
+HELPER FUNCTIONS (verbatim from source notebook)
+```{r helpers}
+get_criterion <- function(f) {
+  if (!is.null(f$criteria$loo)) return(f$criteria$loo)          # psis-loo (TPS)
+  hits <- Filter(function(x) inherits(x, "kfold"), f$criteria)  # kfold5_StationCode (EDSM)
+  if (length(hits) > 0L) hits[[1L]] else loo(f)
+}
+
+
+get_elpd <- function(x) {
+  if (inherits(x, "psis_loo")) x$pointwise[, "elpd_loo"]
+  else                          x$pointwise[, "elpd_kfold"]
+}
+
+
+stacking_weights_streamed <- function(fit_names,
+                                      fit_paths,
+                                      criteria = NULL,
+                                      method   = "stacking") {
+  crit_list <- vector("list", length(fit_names))
+  names(crit_list) <- fit_names
+  for (nm in fit_names) {
+    if (!is.null(criteria) && nm %in% names(criteria)) {
+      crit_list[[nm]] <- criteria[[nm]]
+    } else {
+      f <- readRDS(fit_paths[[nm]])
+      crit_list[[nm]] <- get_criterion(f)
+      rm(f); gc(verbose = FALSE)
+    }
+  }
+  all_psis <- all(vapply(crit_list, function(x) inherits(x, "psis_loo"), logical(1)))
+  w <- if (all_psis) {
+    loo::loo_model_weights(crit_list, method = method)
+  } else {
+    lpd_mat <- do.call(cbind, lapply(crit_list, get_elpd))
+    if (method == "pseudobma") loo::pseudobma_weights(lpd_mat)
+    else                       loo::stacking_weights(lpd_mat)
+  }
+  w <- as.numeric(w); names(w) <- fit_names
+  w
+}
+
+
+epred_marginal_lognormal <- function(object, newdata, re_formula = NA,
+                                     sd_par = "sd_StationCode__Intercept", ...) {
+  if (!isTRUE(is.na(re_formula))) {
+    stop("epred_marginal_lognormal() requires re_formula = NA (the correction assumes RE = 0).")
+  }
+  ep <- posterior_epred(object, newdata = newdata, re_formula = NA, ...)       # S x G = exp(Xbeta)
+  sd_draws <- tryCatch(
+    as.numeric(posterior::as_draws_matrix(object, variable = sd_par)),
+    error = function(e) NULL
+  )
+  if (is.null(sd_draws)) return(ep)   # no random intercept in this model -- no correction needed
+  sweep(ep, 1, exp(sd_draws^2 / 2), `*`)                                       # exp(Xbeta) * exp(sigma^2/2)
+}
+
+
+get_effect_option <- function(option, effect_name) {
+  if (is.null(option)) return(NULL)
+  if (is.list(option) && !is.null(option[[effect_name]])) {
+    return(option[[effect_name]])
+  }
+  if (!is.list(option) && !is.null(names(option)) && effect_name %in% names(option)) {
+    return(unname(option[[effect_name]]))
+  }
+  if (!is.list(option) && !is.null(names(option))) {
+    option_names_norm <- normalize_effect_interaction_names(names(option))
+    effect_name_norm <- normalize_effect_interaction_names(effect_name)
+    idx <- which(option_names_norm == effect_name_norm)
+    if (length(idx) > 0L) {
+      return(unname(option[[idx[1]]]))
+    }
+  }
+  option
+}
+
+
+normalize_effect_interaction_names <- function(effects) {
+  out <- sub("^b_", "", as.character(effects))
+  is_interaction <- grepl(":", out, fixed = TRUE)
+  if (any(is_interaction)) {
+    parts <- strsplit(out[is_interaction], ":", fixed = TRUE)
+    out[is_interaction] <- vapply(parts, function(x) paste(sort(x), collapse = ":"), character(1))
+  }
+  out
+}
+
+
+# Centre the LINES inside a multi-line marquee label.
+# marquee 1.2.1 always left-aligns the lines within a text block: its style `align`
+# and the element's `hjust` only move the whole block, not the lines inside it
+# (verified by pixel-identical renders across align/hjust settings).  So we centre
+# by padding the shorter lines with NON-BREAKING spaces, sized from real font
+# metrics; NBSP is used because markdown collapses ordinary leading spaces.
+# Call BEFORE converting "\n" into markdown hard breaks ("  \n").
+center_md_lines <- function(txt, family = "Helvetica", size = 8.5) {
+  is_bold <- function(x) grepl("^[[:space:]]*[*][*].*[*][*][[:space:]]*$", x)
+  nbsp <- "\u00A0"
+  out <- vapply(txt, function(s) {
+    ln <- strsplit(s, "\n", fixed = TRUE)[[1]]
+    if (length(ln) < 2) return(s)
+    plain <- gsub("**", "", ln, fixed = TRUE)
+    bold  <- is_bold(ln)
+    w <- vapply(seq_along(plain), function(i)
+      systemfonts::string_width(plain[i], family = family, size = size,
+                                weight = if (bold[i]) "bold" else "normal"),
+      numeric(1))
+    sw  <- systemfonts::string_width(nbsp, family = family, size = size)
+    pad <- pmax(0, round((max(w) - w) / (2 * sw)))
+    paste(paste0(strrep(nbsp, pad), ln), collapse = "\n")
+  }, character(1), USE.NAMES = FALSE)
+  names(out) <- names(txt)
+  out
+}
+
+map_parameter_labels <- function(params, param_labels = NULL, lookup_keys = NULL) {
+  out <- as.character(params)
+  keys <- if (is.null(lookup_keys)) out else as.character(lookup_keys)
+  if (is.null(param_labels)) return(out)
+  
+  if (is.function(param_labels)) {
+    return(as.character(param_labels(keys)))
+  }
+  
+  if (is.list(param_labels)) {
+    param_labels <- unlist(param_labels)
+  }
+  
+  if (is.null(names(param_labels))) {
+    return(out)
+  }
+  
+  idx <- match(keys, names(param_labels))
+  out[!is.na(idx)] <- as.character(param_labels[idx[!is.na(idx)]])
+  out
+}
+
+
+normalize_beta_interaction_param <- function(params) {
+  p <- as.character(params)
+  out <- p
+  is_interaction <- grepl("^b_[^:]+:.+", p)
+  
+  if (any(is_interaction)) {
+    raw <- sub("^b_", "", p[is_interaction])
+    parts <- strsplit(raw, ":", fixed = TRUE)
+    norm <- vapply(parts, function(x) paste(sort(x), collapse = ":"), character(1))
+    out[is_interaction] <- paste0("b_", norm)
+  }
+  
+  out
+}
+
+
+plot_ce_effect <- function(effect_data,
+                           effect_name,
+                           x_axis_labels        = NULL,
+                           y_axis_label         = "Predicted effect on response",
+                           legend_title         = NULL,
+                           legend_labels        = NULL,
+                           show_facet_subtitle  = TRUE,
+                           y_limits             = NULL,
+                           legend_position      = "right",
+                           interaction_colors   = NULL) {
+  panel_title <- if (isTRUE(show_facet_subtitle)) effect_name else NULL
+  x_label <- get_effect_option(x_axis_labels, effect_name)
+  if (is.null(x_label)) {
+    x_label <- if (is.factor(effect_data$effect1__)) "Category" else "Predictor value (Z-score)"
+  }
+  
+  if (is.factor(effect_data$effect1__)) {
+    # Categorical main effect
+    p <- ggplot(effect_data, aes(x = effect1__, y = estimate__)) +
+      geom_point(size = 2) +
+      geom_errorbar(aes(ymin = lower__, ymax = upper__), width = 0.2) +
+      labs(
+        title = panel_title,
+        x = x_label,
+        y = y_axis_label
+      ) +
+      theme_minimal()
+    
+  } else if ("effect2__" %in% names(effect_data)) {
+    # Interaction effect
+    effect_data$effect2_factor <- factor(effect_data$effect2__)
+    legend_title_eff <- get_effect_option(legend_title, effect_name)
+    if (is.null(legend_title_eff)) {
+      legend_title_eff <- effect_name
+    }
+    
+    legend_labels_eff <- get_effect_option(legend_labels, effect_name)
+    legend_breaks <- levels(effect_data$effect2_factor)
+    if (is.function(legend_labels_eff)) {
+      legend_labels_eff <- legend_labels_eff(legend_breaks)
+    } else if (!is.null(legend_labels_eff) && !is.null(names(legend_labels_eff))) {
+      mapped <- as.character(legend_breaks)
+      idx <- match(legend_breaks, names(legend_labels_eff))
+      mapped[!is.na(idx)] <- as.character(legend_labels_eff[idx[!is.na(idx)]])
+      legend_labels_eff <- mapped
+    }
+    
+    # Choose colorblind-safe manual scales when colors are supplied; otherwise
+    # fall back to the ggplot2 default discrete palette.
+    c_scale <- if (!is.null(interaction_colors)) {
+      scale_color_manual(values = interaction_colors, name = legend_title_eff,
+                         breaks = legend_breaks, labels = legend_labels_eff)
+    } else {
+      scale_color_discrete(name = legend_title_eff,
+                           breaks = legend_breaks, labels = legend_labels_eff)
+    }
+    f_scale <- if (!is.null(interaction_colors)) {
+      scale_fill_manual(values = interaction_colors, name = legend_title_eff,
+                        breaks = legend_breaks, labels = legend_labels_eff)
+    } else {
+      scale_fill_discrete(name = legend_title_eff,
+                          breaks = legend_breaks, labels = legend_labels_eff)
+    }
+
+    p <- ggplot(effect_data,
+           aes(x = effect1__, y = estimate__, color = effect2_factor, fill = effect2_factor)) +
+      geom_ribbon(
+        aes(ymin = lower__, ymax = upper__),
+        alpha = 0.2
+      ) +
+      geom_line(linewidth = 1) +
+      labs(
+        title = panel_title,
+        x = x_label,
+        y = y_axis_label
+      ) +
+      theme_minimal() +
+      c_scale +
+      f_scale +
+      theme(legend.position = legend_position)
+    
+  } else {
+    # Continuous main effect
+    p <- ggplot(effect_data, aes(x = effect1__, y = estimate__)) +
+      geom_ribbon(aes(ymin = lower__, ymax = upper__), alpha = 0.2) +
+      geom_line(linewidth = 1) +
+      labs(
+        title = panel_title,
+        x = x_label,
+        y = y_axis_label
+      ) +
+      theme_minimal()
+  }
+  
+  if (!is.null(y_limits)) {
+    p <- p + coord_cartesian(ylim = y_limits)
+  }
+  p
+}
+
+
+plot_ce_effect_fl <- function(effect_data, effect_name,
+                              x_axis_labels       = NULL,
+                              y_axis_label        = "Predicted ForkLength (mm)",
+                              show_facet_subtitle = TRUE,
+                              y_limits            = NULL,
+                              ce_color            = "#0072B2",
+                              z_stats             = NULL) {
+  panel_title <- if (isTRUE(show_facet_subtitle)) effect_name else NULL
+  x_label <- get_effect_option(x_axis_labels, effect_name)
+  if (is.null(x_label)) {
+    x_label <- if (is.factor(effect_data$effect1__)) "Category" else "Predictor value (z-score)"
+  }
+
+  if (is.factor(effect_data$effect1__)) {
+    p <- ggplot(effect_data, aes(x = effect1__, y = estimate__)) +
+      geom_point(size = 2, color = ce_color) +
+      geom_errorbar(aes(ymin = lower__, ymax = upper__), width = 0.2, color = ce_color) +
+      labs(title = panel_title, x = x_label, y = y_axis_label) +
+      theme_minimal()
+  } else {
+    p <- ggplot(effect_data, aes(x = effect1__, y = estimate__)) +
+      geom_ribbon(aes(ymin = lower__, ymax = upper__), alpha = 0.25, fill = ce_color) +
+      geom_line(linewidth = 1, color = ce_color) +
+      labs(title = panel_title, x = x_label, y = y_axis_label) +
+      theme_minimal()
+  }
+  # Original-scale x-axis (optional): relabel the z-position ticks with their
+  # back-transformed original-unit values.  Only for continuous effects; categorical
+  # panels (e.g. Edge Type) have no z_stats entry and are left untouched.
+  eff_stats <- if (!is.null(z_stats)) z_stats[[effect_name]] else NULL
+  if (!is.null(eff_stats) && !is.factor(effect_data$effect1__)) {
+    p <- p + scale_x_continuous(
+      labels = function(z_val) {
+        orig <- z_val * eff_stats$sd + eff_stats$mean
+        format(round(orig, eff_stats$digits), big.mark = ",", nsmall = max(0L, eff_stats$digits))
+      }
+    )
+  }
+  # Angle x-tick labels so long factor levels (e.g. Edge Type) don't overlap.
+  p <- p + theme(axis.text.x = element_text(angle = 35, hjust = 1))
+  if (!is.null(y_limits)) p <- p + coord_cartesian(ylim = y_limits)
+  p
+}
+
+
+```
+
+STREAMING COMPUTE + SINGLE-PASS EXTRACTOR
+```{r compute-funcs}
+# SINGLE streaming pass per fit: load once, grab its b_* posterior draws AND its
+# predictive criterion (psis-loo for TPS, kfold for EDSM/FL), then free it before
+# moving on.  Never holds more than one fit in memory — the whole 2.7 GB set is
+# never resident.  Replaces the source notebook's bulk load_fit_objects() +
+# separate draws/criteria passes.
+extract_beta_and_criterion <- function(fit_names, fit_paths) {
+  draws <- vector("list", length(fit_names)); names(draws) <- fit_names
+  crit  <- vector("list", length(fit_names)); names(crit)  <- fit_names
+  for (nm in fit_names) {
+    f  <- readRDS(fit_paths[[nm]])
+    df <- posterior::as_draws_df(f)
+    bcols <- grep("^b_", names(df), value = TRUE)
+    draws[[nm]] <- as.data.frame(df)[, bcols, drop = FALSE]
+    crit[[nm]]  <- get_criterion(f)
+    rm(f, df); gc(verbose = FALSE)
+  }
+  list(draws = draws, criteria = crit)
+}
+
+
+# Generic STREAMING ensemble conditional-effects compute for ONE survey.
+# Loads each fit one at a time — Pass A captures one reference grid per requested
+# effect (stops once all grids are captured); Pass B reloads each non-zero-weight
+# fit, predicts on every grid, accumulates weight * draws, and frees the fit — so
+# peak memory is ~one fit, never the whole set.  `epred_fn` picks the response-scale
+# predictor:
+#   catch        -> epred_marginal_lognormal (lognormal RE correction)
+#   fork length  -> posterior_epred          (gaussian / identity; no correction)
+# Returns list(ce = <named CE data frames>, pred_names).  This is the cached unit:
+# everything downstream is pure layout and touches no fit.
+compute_survey_ce <- function(fit_names, fit_paths, selected_params, criteria,
+                              method = "stacking", resolution = 100,
+                              re_formula = NA, probs = c(0.05, 0.95),
+                              epred_fn = epred_marginal_lognormal) {
+  summ_cols <- c("estimate__", "lower__", "upper__", "se__")
+
+  build_model_newdata <- function(model, newdata_ref) {
+    needed <- all.vars(model$formula$formula[[3]])
+    nd  <- newdata_ref
+    dat <- model$data
+    for (v in setdiff(needed, names(nd))) {
+      if (!v %in% names(dat)) next
+      col <- dat[[v]]
+      # Categoricals are held at the model's REFERENCE level (not the modal level),
+      # so every conditional-effects panel conditions on the same baseline that the
+      # brms reference grid uses in Pass A — one rule, statable in a caption:
+      # "continuous covariates at their means (0 on the z scale), categorical
+      # covariates at their reference level (Edge type = Cut Bank, water body =
+      # Distributary)".  Using the modal level here instead made panels disagree:
+      # e.g. EDSM dox_z conditioned on Distributary while the other EDSM panels
+      # conditioned on Shoal, so absolute predicted heights were not comparable.
+      nd[[v]] <- if (is.numeric(col)) {
+        mean(col, na.rm = TRUE)
+      } else if (is.factor(col)) {
+        levels(col)[1L]
+      } else {
+        sort(unique(as.character(col)))[1L]   # brms sorts character -> factor levels
+      }
+    }
+    nd
+  }
+
+  weights <- stacking_weights_streamed(fit_names, fit_paths, criteria, method)
+
+  cand_effects <- unique(sub("^b_", "", as.character(selected_params)))
+  cand_norm    <- normalize_effect_interaction_names(cand_effects)
+
+  grids       <- list()
+  ce_template <- list()
+  pred_names  <- character(0)
+
+  # ---- Pass A: capture one reference grid per effect ----
+  for (nm in fit_names) {
+    f <- readRDS(fit_paths[[nm]])
+    rhs <- tryCatch(f$formula$formula[[3]], error = function(e) NULL)
+    if (!is.null(rhs)) pred_names <- union(pred_names, all.vars(rhs))
+    need <- cand_effects[!cand_effects %in% names(grids)]
+    if (length(need) > 0L) {
+      ce_f <- tryCatch(
+        suppressWarnings(conditional_effects(
+          f, effects = need, resolution = resolution, re_formula = re_formula)),
+        error = function(e) NULL
+      )
+      if (!is.null(ce_f) && length(ce_f) > 0L) {
+        ret_norm <- normalize_effect_interaction_names(names(ce_f))
+        for (j in seq_along(ce_f)) {
+          key <- cand_effects[match(ret_norm[j], cand_norm)]
+          if (is.na(key) || key %in% names(grids)) next
+          cedf <- ce_f[[j]]
+          ce_template[[key]] <- cedf
+          nd <- cedf; nd[intersect(names(nd), summ_cols)] <- NULL
+          grids[[key]] <- nd
+        }
+      }
+    }
+    rm(f); gc(verbose = FALSE)
+    if (all(cand_effects %in% names(grids))) break
+  }
+
+  effect_names <- cand_effects[cand_effects %in% names(grids)]
+  missing_eff  <- setdiff(cand_effects, effect_names)
+  if (length(missing_eff) > 0L)
+    warning("Effects not found in any model: ", paste(missing_eff, collapse = ", "))
+  if (length(effect_names) == 0L)
+    stop("No requested effects are available for this survey.")
+
+  # ---- Pass B: weighted ensemble prediction on each grid ----
+  acc <- setNames(vector("list", length(effect_names)), effect_names)
+  for (nm in fit_names) {
+    w <- weights[[nm]]
+    if (is.na(w) || w <= 0) next
+    f <- readRDS(fit_paths[[nm]])
+    pred_names <- union(pred_names, all.vars(f$formula$formula[[3]]))
+    for (eff in effect_names) {
+      nd   <- build_model_newdata(f, grids[[eff]])
+      pred <- epred_fn(f, newdata = nd, re_formula = re_formula)
+      acc[[eff]] <- if (is.null(acc[[eff]])) w * pred else acc[[eff]] + w * pred
+    }
+    rm(f); gc(verbose = FALSE)
+  }
+
+  # ---- summarize ----
+  ce_list <- list()
+  for (eff in effect_names) {
+    em <- acc[[eff]]
+    lo <- apply(em, 2, quantile, probs[1])
+    up <- apply(em, 2, quantile, probs[2])
+    mn <- apply(em, 2, median)
+    mn <- pmax(lo, pmin(mn, up))
+    base_ce <- ce_template[[eff]]
+    base_ce[intersect(names(base_ce), summ_cols)] <- NULL
+    base_ce$estimate__ <- mn; base_ce$lower__ <- lo; base_ce$upper__ <- up
+    ce_list[[eff]] <- base_ce
+    message("[stream CE FULLENS] '", eff, "' — grid ", length(mn),
+            " pts | est range ", paste(round(range(mn), 5), collapse = " .. "))
+  }
+  list(ce = ce_list, pred_names = pred_names)
+}
+
+# FL/gaussian epred wrapper (no lognormal correction): identical signature to
+# epred_marginal_lognormal so it slots into compute_survey_ce's epred_fn.
+posterior_epred_plain <- function(object, newdata, re_formula = NA, ...) {
+  posterior_epred(object, newdata = newdata, re_formula = re_formula, ...)
+}
+
+```
+
+CACHED COMBINED CONDITIONAL-EFFECTS PLOT BUILDER
+```{r ccep-cached}
+# CACHED combined conditional-effects plot.  Identical layout/back-transform to the
+# source combined_cond_effects_plot, but takes the two precomputed per-survey CE
+# results (from compute_survey_ce) instead of streaming fits itself.
+combined_cond_effects_plot_cached <- function(
+  tps_result,
+  edsm_result,
+  wide_y_params        = NULL,
+  narrow_y_params      = NULL,
+  param_labels         = NULL,
+  y_axis_label         = "Predicted effect on response",
+  tps_title            = "TPS",
+  edsm_title           = "EDSM",
+  main_title           = "Combined conditional effects",
+  show_facet_subtitles = FALSE,
+  legend_position      = "right",
+  interaction_colors   = c("#0072B2", "#E69F00", "#CC79A7"),
+  tps_z_stats          = NULL,
+  edsm_z_stats         = NULL,
+  facet_spec           = NULL
+) {
+  # Convert user param names (b_ prefix optional) to brms CE effect names
+  to_ce_names <- function(params, pred_names) {
+    unique(vapply(as.character(params), function(x) {
+      eff <- sub("^b_", "", x)
+      if (grepl(":", eff, fixed = TRUE)) return(eff)
+      if (eff %in% pred_names) return(eff)
+      hits <- pred_names[startsWith(eff, pred_names)]
+      if (length(hits) > 0L) return(hits[which.max(nchar(hits))])
+      eff
+    }, character(1)))
+  }
+
+  tps_ce   <- tps_result$ce
+  edsm_ce  <- edsm_result$ce
+  all_pred <- union(tps_result$pred_names, edsm_result$pred_names)
+
+  # ── y-axis group classification ───────────────────────────────────────────
+  # normalize_effect_interaction_names is defined earlier in this notebook
+  wide_norm <- if (!is.null(wide_y_params))
+    normalize_effect_interaction_names(to_ce_names(wide_y_params, all_pred)) else character(0)
+
+  narrow_norm <- if (!is.null(narrow_y_params))
+    normalize_effect_interaction_names(to_ce_names(narrow_y_params, all_pred)) else NULL
+
+  classify_eff <- function(eff) {
+    en <- normalize_effect_interaction_names(eff)
+    if (en %in% wide_norm) return("wide")
+    if (!is.null(narrow_norm) && en %in% narrow_norm) return("narrow")
+    if (is.null(narrow_norm)) return("narrow")  # NULL = all remaining are narrow
+    "free"
+  }
+
+  # y-limits derived from both surveys' CE data for a given group
+  get_ylim_for_group <- function(group) {
+    dfs <- Filter(Negate(is.null), c(
+      lapply(names(tps_ce),  function(n) if (classify_eff(n) == group) tps_ce[[n]]  else NULL),
+      lapply(names(edsm_ce), function(n) if (classify_eff(n) == group) edsm_ce[[n]] else NULL)
+    ))
+    if (length(dfs) == 0L) return(NULL)
+    range(unlist(lapply(dfs, function(df) c(df$lower__, df$upper__))), na.rm = TRUE)
+  }
+
+  y_lim_wide   <- get_ylim_for_group("wide")
+  y_lim_narrow <- get_ylim_for_group("narrow")
+
+  # ── x-axis label lookup: convert param_labels keys to CE names ────────────
+  x_labels_ce <- param_labels
+  if (!is.null(x_labels_ce) && !is.null(names(x_labels_ce))) {
+    names(x_labels_ce) <- vapply(names(x_labels_ce),
+                                 function(k) to_ce_names(k, all_pred),
+                                 character(1))
+  }
+
+  # ── build individual effect plots ─────────────────────────────────────────
+  # z_stats: named list variable -> list(mean, sd, digits) for back-transform.
+  # NULL means keep z-score axis as-is.
+  make_plots <- function(ce_list, z_stats = NULL) {
+    lapply(names(ce_list), function(eff) {
+      ylim <- switch(classify_eff(eff),
+        wide   = y_lim_wide,
+        narrow = y_lim_narrow,
+        NULL
+      )
+
+      ce_data        <- ce_list[[eff]]
+      is_interaction <- "effect2__" %in% names(ce_data)
+      is_categorical <- is.factor(ce_data$effect1__)
+
+      # For interaction plots the x-axis label should name the swept variable
+      # (effect1__), not the full interaction term.  Look up the first variable's
+      # label and override the entry keyed by the full interaction name.
+      x_labels_here <- x_labels_ce
+      first_term <- strsplit(eff, ":", fixed = TRUE)[[1]][1]
+      if (is_interaction && !is.null(x_labels_ce)) {
+        first_term_label <- get_effect_option(x_labels_ce, first_term)
+        if (!is.null(first_term_label)) {
+          x_labels_here        <- as.list(x_labels_ce)
+          x_labels_here[[eff]] <- first_term_label
+        }
+      }
+
+      # Legend title and value labels for interaction plots.
+      # When z_stats contains out30_z, back-transform the legend breaks to
+      # original outflow units (cms; out30_z stats are pre-scaled to cms).
+      out30_stats <- z_stats[["out30_z"]]
+      if (is_interaction) {
+        leg_title <- if (!is.null(out30_stats)) "Outflow (cms)" else "Outflow (z-score)"
+        leg_labels <- if (!is.null(out30_stats)) {
+          function(breaks) {
+            orig <- as.numeric(breaks) * out30_stats$sd + out30_stats$mean
+            format(round(orig, -1), big.mark = ",")
+          }
+        } else {
+          function(breaks) paste0("z = ", round(as.numeric(breaks), 2))
+        }
+      } else {
+        leg_title  <- NULL
+        leg_labels <- NULL
+      }
+
+      p <- plot_ce_effect(
+        effect_data         = ce_data,
+        effect_name         = eff,
+        x_axis_labels       = x_labels_here,
+        y_axis_label        = y_axis_label,
+        legend_title        = leg_title,
+        legend_labels       = leg_labels,
+        show_facet_subtitle = show_facet_subtitles,
+        y_limits            = ylim,
+        legend_position     = legend_position,
+        interaction_colors  = interaction_colors
+      )
+
+      # Back-transform continuous x-axis tick labels to original scale.
+      # Uses the first variable's stats (for interactions, the swept variable).
+      if (!is.null(z_stats) && !is_categorical) {
+        eff_stats <- z_stats[[first_term]]
+        if (!is.null(eff_stats)) {
+          p <- p + scale_x_continuous(
+            labels = function(z_val) {
+              orig <- z_val * eff_stats$sd + eff_stats$mean
+              format(round(orig, eff_stats$digits),
+                     big.mark = ",",
+                     nsmall   = max(0L, eff_stats$digits))
+            }
+          )
+        }
+      }
+
+      # Global axis typography: suppress per-facet y-axis title (replaced below by
+      # a single shared label), set x-axis title to 10 pt, tick labels to 8 pt.
+      p <- p + theme(
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 9),
+        axis.text    = element_text(size = 8)
+      )
+
+      # Angle x-axis tick labels for categorical effects (Edge_Type, habitat2020)
+      if (is_categorical) {
+        p <- p + theme(axis.text.x = element_text(size = 8, angle = 20, hjust = 1))
+      }
+
+      # Move interaction legend inside plot at top-left to free up horizontal space
+      if (is_interaction) {
+        p <- p + theme(
+          legend.title = element_text(size = 8),
+          legend.text = element_text(size = 8),
+          legend.position      = c(0, 1.1),
+          legend.justification = c(0, 1),
+          legend.background    = element_rect(fill = alpha("white", 0.5), color = NA),
+          legend.key.size      = unit(0.3, "cm")
+        )
+      }
+
+      p
+    })
+  }
+
+  tps_plots  <- make_plots(tps_ce,  z_stats = tps_z_stats)
+  edsm_plots <- make_plots(edsm_ce, z_stats = edsm_z_stats)
+
+  # ── two-column patchwork assembly ─────────────────────────────────────────
+  # Build ONE unified n_max×2 grid so every row gets equal height.
+  # When facet_spec is provided, rows are placed by explicit row number so
+  # loner covariates from different surveys align in the same grid row; a
+  # spacer is inserted wherever a survey has no entry for a given row.
+  # Without facet_spec, falls back to positional interleaving.
+
+  # Named plot lookup by (normalized) CE effect name
+  tps_plot_map  <- setNames(tps_plots,  names(tps_ce))
+  edsm_plot_map <- setNames(edsm_plots, names(edsm_ce))
+
+  lookup_plot <- function(cov, plot_map) {
+    ce_raw  <- to_ce_names(cov, all_pred)
+    ce_norm <- normalize_effect_interaction_names(ce_raw)
+    map_norm <- normalize_effect_interaction_names(names(plot_map))
+    idx <- which(map_norm == ce_norm)
+    if (length(idx) == 0L) patchwork::plot_spacer() else plot_map[[idx[1L]]]
+  }
+
+  attach_col_title <- function(p, title_text) {
+    p + ggplot2::labs(title = title_text) +
+      ggplot2::theme(plot.title = ggplot2::element_text(
+        size = 10, hjust = 0.5, face = "bold", margin = ggplot2::margin(b = 4)))
+  }
+
+  if (!is.null(facet_spec)) {
+    all_rows   <- sort(unique(facet_spec$row))
+    n_max      <- length(all_rows)
+    tps_rows   <- facet_spec[facet_spec$survey == "tps",  ]
+    edsm_rows  <- facet_spec[facet_spec$survey == "edsm", ]
+
+    tps_first_row  <- if (nrow(tps_rows)  > 0L) min(tps_rows$row)  else Inf
+    edsm_first_row <- if (nrow(edsm_rows) > 0L) min(edsm_rows$row) else Inf
+
+    all_plots <- vector("list", 2L * n_max)
+    for (i in seq_along(all_rows)) {
+      r  <- all_rows[i]
+      te <- tps_rows[tps_rows$row   == r, ]
+      ee <- edsm_rows[edsm_rows$row == r, ]
+
+      tps_p  <- if (nrow(te) > 0L) lookup_plot(te$covariate[1L],  tps_plot_map)  else patchwork::plot_spacer()
+      edsm_p <- if (nrow(ee) > 0L) lookup_plot(ee$covariate[1L],  edsm_plot_map) else patchwork::plot_spacer()
+
+      if (r == tps_first_row  && !is.null(tps_title)  && nzchar(as.character(tps_title)))
+        tps_p  <- attach_col_title(tps_p,  tps_title)
+      if (r == edsm_first_row && !is.null(edsm_title) && nzchar(as.character(edsm_title)))
+        edsm_p <- attach_col_title(edsm_p, edsm_title)
+
+      all_plots[[2L * i - 1L]] <- tps_p
+      all_plots[[2L * i]]      <- edsm_p
+    }
+  } else {
+    # Positional fallback (no facet_spec)
+    n_tps  <- length(tps_plots)
+    n_edsm <- length(edsm_plots)
+    n_max  <- max(n_tps, n_edsm)
+
+    if (n_tps  < n_max)
+      tps_plots  <- c(tps_plots,  rep(list(patchwork::plot_spacer()), n_max - n_tps))
+    if (n_edsm < n_max)
+      edsm_plots <- c(edsm_plots, rep(list(patchwork::plot_spacer()), n_max - n_edsm))
+
+    if (!is.null(tps_title) && nzchar(as.character(tps_title)))
+      tps_plots[[1]] <- attach_col_title(tps_plots[[1]], tps_title)
+    if (!is.null(edsm_title) && nzchar(as.character(edsm_title)))
+      edsm_plots[[1]] <- attach_col_title(edsm_plots[[1]], edsm_title)
+
+    all_plots <- vector("list", 2L * n_max)
+    for (i in seq_len(n_max)) {
+      all_plots[[2L * i - 1L]] <- tps_plots[[i]]
+      all_plots[[2L * i]]      <- edsm_plots[[i]]
+    }
+  }
+
+  # guides = "keep" so interaction plots retain their inside-positioned legends
+  grid_panel <- patchwork::wrap_plots(all_plots, ncol = 2L, byrow = TRUE,
+                                      guides = "keep")
+
+  # Shared rotated y-axis title spanning the full figure height.
+  # wrap_elements() lets a raw grid grob participate in patchwork layout.
+  y_grob <- grid::textGrob(
+    y_axis_label,
+    rot  = 90,
+    gp   = grid::gpar(fontsize = 10)
+  )
+
+  patchwork::wrap_elements(y_grob) + grid_panel +
+    patchwork::plot_layout(widths = c(0.03, 0.97))
+}
+
+```
+
+CACHED FORK-LENGTH CONDITIONAL-EFFECTS PLOT BUILDER
+```{r fl-ce-cached}
+# CACHED fork-length ensemble conditional-effects plot.  The layout half of the
+# source ensemble_conditional_effects_stacking_fl(): takes the precomputed
+# ensemble CE list (named effect -> CE df, from compute_survey_ce) and assembles
+# the faceted figure.  Keeps the freed-y-axis behaviour: effects named in
+# free_y_effects get their own y-axis; the rest share one range computed from the
+# coupled facets only.
+plot_fl_ensemble_ce_cached <- function(
+  ensemble_ce_list,
+  preferred_order      = NULL,
+  ncol = 1, nrow = NULL,
+  main_title           = "TPS fork length: model-averaged conditional effects",
+  x_axis_labels        = NULL,
+  y_axis_label         = "Predicted ForkLength (mm)",
+  show_facet_subtitles = FALSE,
+  fixed_y_scale        = TRUE,
+  free_y_effects       = NULL,
+  ce_color             = "#0072B2",
+  z_stats              = NULL
+) {
+  effect_names <- names(ensemble_ce_list)
+  if (!is.null(preferred_order)) {
+    effect_names <- c(preferred_order[preferred_order %in% effect_names],
+                      setdiff(effect_names, preferred_order))
+  }
+  ensemble_ce_list <- ensemble_ce_list[effect_names]
+
+  y_limits <- NULL
+  if (isTRUE(fixed_y_scale)) {
+    # Shared y-range from the coupled facets only; free_y_effects are excluded so
+    # they don't stretch the common scale.
+    shared_effects <- setdiff(names(ensemble_ce_list), free_y_effects)
+    y_limits <- range(unlist(lapply(ensemble_ce_list[shared_effects],
+                                    function(df) c(df$lower__, df$upper__))), na.rm = TRUE)
+  }
+
+  plot_list <- list()
+  for (eff in names(ensemble_ce_list)) {
+    eff_y_limits <- if (eff %in% free_y_effects) NULL else y_limits
+    plot_list[[eff]] <- plot_ce_effect_fl(
+      effect_data = ensemble_ce_list[[eff]], effect_name = eff,
+      x_axis_labels = x_axis_labels, y_axis_label = y_axis_label,
+      show_facet_subtitle = show_facet_subtitles, y_limits = eff_y_limits, ce_color = ce_color,
+      z_stats = z_stats
+    )
+  }
+
+  wrap_plots(plot_list, ncol = ncol, nrow = nrow) +
+    plot_annotation(title = main_title)
+}
+
+```
+
+FORK-LENGTH BETA FOREST FUNCTION (verbatim)
+```{r fl-forest-fn}
+tps_fl_cluster_forest <- function(
+  fit_names, fit_paths,
+  criteria              = NULL,        # precomputed kfold criteria (skip disk re-read)
+  draws_cache           = NULL,        # name -> b_* draws df (skip fit loading)
+  patterns_to_exclude   = character(0),
+  include_regex         = "^b_",
+  preferred_param_order = NULL,
+  param_labels          = NULL,
+  declutter_threshold   = 0.95,
+  label_mode            = c("centered", "right"),
+  fill_color            = "#0072B2",
+  title                 = NULL,
+  x_axis_label          = "Posterior beta estimate (z-score)",
+  x_limits              = NULL,
+  slab_n                = 128L,
+  band_gap              = 0.4,
+  annot_size            = 3.2,
+  annot_angle           = 45,
+  # ── "centered" mode knobs ───────────────────────────────────────────────────
+  slab_scale            = 1.2,   # slab peak height (band units)
+  annot_base_gap        = 0.15,  # gap from slab top (centered) / baseline (right) to first label
+  annot_height          = 2.0,   # vertical room reserved for the angled labels (band units)
+  annot_x_gap           = 0.6,   # horizontal spacing between centered labels (x data units = mm)
+  annot_shift           = 0.5,   # push centered labels further above their slab (band units)
+  annot_hjust           = 0,
+  # ── "right" mode knobs (ALT2 layout: 45-degree labels march RIGHT from an absolute anchor) ──
+  band_half             = 1.7,   # row upward-extent (band units); sets row spacing ALONE
+                                 #   (decoupled from slab_scale and the annotation knobs)
+  annot_x               = NULL,  # absolute LEFT x where every row's label set begins (all rows align here);
+                                 #   NULL = auto (right side of the panel, sized so the longest row fits)
+  annot_y               = 0.35,  # label distance ABOVE the baseline (band units; 0 = on the line)
+                                 #   (reuses annot_x_gap for the in-cluster rightward spacing)
+  method                = "stacking"
+) {
+  label_mode <- match.arg(label_mode)
+  regex_excl <- if (length(patterns_to_exclude) > 0L)
+    paste(patterns_to_exclude, collapse = "|") else "XXXXXXXX_NOMATCH"
+  load_one <- function(nm)
+    if (exists(nm, inherits = TRUE)) get(nm, inherits = TRUE) else readRDS(fit_paths[[nm]])
+
+  # Full-ensemble stacking weights (from criteria only when supplied).
+  weights <- stacking_weights_streamed(fit_names, fit_paths, criteria, method)
+
+  # Per-fit b_* draws (prefer the cache; else stream + unload).
+  draws_raw <- vector("list", length(fit_names)); names(draws_raw) <- fit_names
+  norm_list <- vector("list", length(fit_names)); names(norm_list) <- fit_names
+  for (nm in fit_names) {
+    df_full <- if (!is.null(draws_cache) && nm %in% names(draws_cache)) {
+      draws_cache[[nm]]
+    } else {
+      f <- load_one(nm); d <- as_draws_df(f); rm(f); gc(verbose = FALSE); d
+    }
+    df       <- df_full %>% dplyr::select(-dplyr::matches(regex_excl))
+    raw_cols <- names(df)[grepl(include_regex, names(df))]
+    draws_raw[[nm]] <- df[, raw_cols, drop = FALSE]
+    norm_list[[nm]] <- setNames(normalize_beta_interaction_param(raw_cols), raw_cols)
+  }
+
+  all_norm_params <- sort(unique(unlist(lapply(norm_list, unname))))
+  if (!is.null(preferred_param_order)) {
+    all_norm_params <- c(preferred_param_order[preferred_param_order %in% all_norm_params],
+                         setdiff(all_norm_params, preferred_param_order))
+  }
+
+  # Per-covariate declutter: keep top models by renormalized weight up to the
+  # cumulative threshold; label uses each model's OVERALL stacking weight.
+  fmt_w <- function(w) ifelse(w >= 0.01, sprintf("%.0f%%", 100 * w), "<1%")
+  row_blocks <- list()
+  for (p in all_norm_params) {
+    model_idx <- which(vapply(norm_list, function(nv) p %in% nv, logical(1)))
+    if (length(model_idx) == 0L) next
+    w_raw <- weights[model_idx]; total <- sum(w_raw)
+    w_sub <- if (total > 0) w_raw / total else rep(0, length(w_raw))
+    ord   <- order(w_sub, decreasing = TRUE)
+    model_idx <- model_idx[ord]; w_sub <- w_sub[ord]; w_raw <- w_raw[ord]
+    keep_n <- if (total > 0) which(cumsum(w_sub) >= declutter_threshold)[1L] else NA_integer_
+    if (is.na(keep_n)) keep_n <- length(w_sub)
+    model_idx <- model_idx[seq_len(keep_n)]; w_raw <- w_raw[seq_len(keep_n)]
+    for (k in seq_along(model_idx)) {
+      i  <- model_idx[k]; nm <- fit_names[i]
+      rc <- names(norm_list[[i]])[norm_list[[i]] == p][1L]
+      row_blocks[[length(row_blocks) + 1L]] <- data.frame(
+        param = p, fit_name = nm,
+        model_num = sub(".*?([0-9]+)$", "\\1", nm),
+        overall_weight = w_raw[k],
+        estimate = draws_raw[[i]][[rc]],
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  if (length(row_blocks) == 0L) stop("No covariates with contributing models found.")
+  plot_df <- bind_rows(row_blocks)
+
+  ordered_present <- all_norm_params[all_norm_params %in% unique(plot_df$param)]
+  K <- length(ordered_present)
+  param_label_lookup <- setNames(
+    map_parameter_labels(ordered_present, param_labels, lookup_keys = ordered_present),
+    ordered_present
+  )
+
+  # ── Annotation table + vertical budget (per label_mode) ─────────────────────
+  if (label_mode == "centered") {
+    annot <- plot_df %>%
+      dplyr::group_by(param, fit_name, model_num, overall_weight) %>%
+      dplyr::summarise(median_x = median(estimate), .groups = "drop") %>%
+      dplyr::group_by(param) %>%
+      dplyr::arrange(median_x, .by_group = TRUE) %>%
+      dplyr::mutate(
+        n_mod      = dplyr::n(),
+        center     = mean(median_x),
+        label_x    = center + (dplyr::row_number() - (n_mod + 1) / 2) * annot_x_gap,
+        label_text = paste0(model_num, " (", fmt_w(overall_weight), ")")
+      ) %>% dplyr::ungroup()
+    up_extent <- slab_scale + annot_base_gap + annot_shift + annot_height
+  } else {
+    # ALT2 layout: one angled label per model, in median order, that LEFT-aligns at
+    # an absolute x and marches RIGHTWARD by annot_x_gap.  Every covariate's set lines
+    # up on its left edge, independent of slab position; y is set directly off the
+    # baseline (annot_y) below, so the labels sit low, over the band baselines.
+    annot <- plot_df %>%
+      dplyr::group_by(param, fit_name, model_num, overall_weight) %>%
+      dplyr::summarise(median_x = median(estimate), .groups = "drop") %>%
+      dplyr::group_by(param) %>%
+      dplyr::arrange(median_x, .by_group = TRUE) %>%
+      dplyr::mutate(
+        march      = (dplyr::row_number() - 1) * annot_x_gap,   # rightward offset from the anchor
+        label_text = paste0(model_num, " (", fmt_w(overall_weight), ")")
+      ) %>% dplyr::ungroup()
+    up_extent <- band_half          # row height set by band_half ALONE; slab_scale stays absolute
+  }
+
+  row_spacing <- up_extent + band_gap
+  pos <- setNames((K - seq_len(K)) * row_spacing, ordered_present)   # first param on top
+  plot_df$baseline <- pos[plot_df$param]
+  annot$baseline   <- pos[annot$param]
+
+  # ── Manual density slabs, all rising UP from baseline, GLOBAL equal-area ─────
+  slab_polys <- plot_df %>%
+    dplyr::group_by(param, fit_name, baseline) %>%
+    dplyr::group_modify(~{
+      d <- density(.x$estimate, n = slab_n, cut = 0)
+      data.frame(x = d$x, dens = d$y)
+    }) %>% dplyr::ungroup() %>%
+    dplyr::mutate(height = dens / max(dens) * slab_scale)
+  slab_polys$grp <- paste(slab_polys$fit_name, slab_polys$param, sep = "__")
+
+  slab_top <- slab_polys %>% dplyr::group_by(param) %>%
+    dplyr::summarise(slab_top = max(height), .groups = "drop")
+
+  curve_df <- slab_polys %>% dplyr::mutate(y = baseline + height)
+  poly_df  <- curve_df %>% dplyr::group_by(grp, param) %>%
+    dplyr::group_modify(~ rbind(
+      data.frame(x = .x$x,      y = .x$y),
+      data.frame(x = rev(.x$x), y = rev(.x$baseline))
+    )) %>% dplyr::ungroup()
+
+  # ── Shared limits ───────────────────────────────────────────────────────────
+  y_lim <- c(min(pos) - band_gap / 2, max(pos) + up_extent + band_gap / 2)
+  xq    <- quantile(plot_df$estimate, probs = c(0.005, 0.995), na.rm = TRUE)
+  x_lim <- if (!is.null(x_limits)) x_limits else c(floor(xq[1]), ceiling(xq[2]))
+
+  # ── Label anchor y (and x for right mode) ───────────────────────────────────
+  if (label_mode == "centered") {
+    annot <- dplyr::left_join(annot, slab_top, by = "param")
+    annot$slab_top[is.na(annot$slab_top)] <- 0
+    annot$label_y <- annot$baseline + annot$slab_top + annot_base_gap + annot_shift
+  } else {
+    # Left edge of the label block: the same absolute x for every row.  Auto-default
+    # places it so the LONGEST row's labels finish just inside the right edge.
+    max_march <- max(annot$march)
+    anchor_x  <- if (!is.null(annot_x)) annot_x else x_lim[2] - max_march - 0.3
+    annot$label_x <- anchor_x + annot$march
+    annot$label_y <- annot$baseline + annot_y
+  }
+
+  right_pad <- if (label_mode == "right") 40 else 5.5
+
+  ggplot() +
+    geom_hline(yintercept = pos, color = "grey75", linewidth = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    geom_polygon(data = poly_df, aes(x = x, y = y, group = grp),
+                 fill = fill_color, color = NA, alpha = 0.4) +
+    geom_path(data = curve_df, aes(x = x, y = y, group = grp),
+              color = "black", linewidth = 0.4) +
+    geom_point(data = annot, aes(x = median_x, y = baseline),
+               color = fill_color, size = 2.3, shape = 16) +
+    geom_text(data = annot, aes(x = label_x, y = label_y, label = label_text),
+              angle = annot_angle, size = annot_size,
+              hjust = annot_hjust, vjust = 0.5, color = "grey20") +
+    coord_cartesian(ylim = y_lim, xlim = x_lim, clip = "off") +
+    scale_x_continuous(name = x_axis_label) +
+    scale_y_continuous(breaks = pos, labels = param_label_lookup[ordered_present], name = NULL) +
+    labs(title = title) +
+    theme_minimal() +
+    theme(
+      axis.text.y        = element_text(size = 10, angle = 30, hjust = 1),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      plot.margin        = margin(5.5, right_pad, 5.5, 5.5)
+    )
+}
+
+```
+
+BUTTERFLY-STYLE FORK-LENGTH FOREST — ALT90 (90-degree annotations, E&C single column)
+Right-march layout adapted to match the butterfly ALT4/ALT5 styling: 90-degree vertical
+annotations with "%"/space stripped, black median hash marks, wrapped covariate labels,
+Helvetica 8-9 pt lettering, 84 mm width, and axis spacing / curve heights tuned to the
+butterfly for continuity.  The image HEIGHT is dictated by the number of covariate axes
+(returned as attr(p, "fig_height_in")), not clamped to the E&C max height.
+```{r fl-forest-alt90-fn}
+tps_fl_cluster_forest_alt90 <- function(
+  fit_names, fit_paths,
+  criteria              = NULL,
+  draws_cache           = NULL,
+  patterns_to_exclude   = character(0),
+  include_regex         = "^b_",
+  preferred_param_order = NULL,
+  param_labels          = NULL,
+  declutter_threshold   = 0.95,
+  min_weight            = 0.01,        # drop models with overall stacking weight < this (butterfly parity)
+  fill_color            = "#0072B2",
+  slab_alpha            = 0.4,
+  title                 = NULL,
+  x_axis_label          = "Posterior beta estimate (mm change in ForkLength)",
+  x_limits              = NULL,
+  slab_n                = 128L,
+  # ── geometry (butterfly-continuity defaults) ──────────────────────────────
+  band_half             = 3.0,         # row up-extent; row_spacing = band_half + band_gap
+                                       #   (3.0 + 0.4 = 3.4 matches the butterfly axis spacing)
+  band_gap              = 0.4,
+  slab_scale            = 1.5,         # curve peak height (band units); matches the butterfly
+  outer_pad_frac_top    = 0.8,         # top margin as a fraction of row_spacing (extra room for
+                                       #   the vertical 90-degree labels)
+  outer_pad_frac_bottom = 0.55,        # bottom margin as a fraction of row_spacing
+  # ── median hash (black, like the butterfly) ───────────────────────────────
+  median_tick_len       = 0.6,         # tick length (band units), rising INTO the slab
+  median_tick_color     = "black",
+  median_tick_lw        = 0.6,
+  # ── annotations (90-degree, marching RIGHT from an absolute anchor) ────────
+  annot_angle           = 90,
+  annot_size            = 2.85,        # geom_text size in mm; 2.85 mm ~= 8.1 pt
+  annot_x_gap           = 0.25,        # in-cluster spacing between stacked labels (x data units)
+  annot_x               = NULL,        # absolute LEFT x anchor of every row's label set; NULL = auto
+  annot_y               = 0.35,        # label offset ABOVE the baseline (band units)
+  annot_hjust           = 0,
+  annot_vjust           = 0.5,
+  # ── fonts ─────────────────────────────────────────────────────────────────
+  base_family           = "Helvetica",
+  axis_text_y_size      = 8.5,
+  axis_text_x_size      = 8,
+  axis_title_size       = 9,
+  # ── image height auto-sizing (dictated by the axes) ───────────────────────
+  band_unit_in          = 0.178,       # physical inches per band unit (butterfly continuity)
+  axis_extra_in         = 0.9,         # fixed inches for the x-axis title/labels + margins
+  method                = "stacking"
+) {
+  regex_excl <- if (length(patterns_to_exclude) > 0L)
+    paste(patterns_to_exclude, collapse = "|") else "XXXXXXXX_NOMATCH"
+  load_one <- function(nm)
+    if (exists(nm, inherits = TRUE)) get(nm, inherits = TRUE) else readRDS(fit_paths[[nm]])
+
+  weights <- stacking_weights_streamed(fit_names, fit_paths, criteria, method)
+
+  draws_raw <- vector("list", length(fit_names)); names(draws_raw) <- fit_names
+  norm_list <- vector("list", length(fit_names)); names(norm_list) <- fit_names
+  for (nm in fit_names) {
+    df_full <- if (!is.null(draws_cache) && nm %in% names(draws_cache)) {
+      draws_cache[[nm]]
+    } else {
+      f <- load_one(nm); d <- as_draws_df(f); rm(f); gc(verbose = FALSE); d
+    }
+    df       <- df_full %>% dplyr::select(-dplyr::matches(regex_excl))
+    raw_cols <- names(df)[grepl(include_regex, names(df))]
+    draws_raw[[nm]] <- df[, raw_cols, drop = FALSE]
+    norm_list[[nm]] <- setNames(normalize_beta_interaction_param(raw_cols), raw_cols)
+  }
+
+  all_norm_params <- sort(unique(unlist(lapply(norm_list, unname))))
+  if (!is.null(preferred_param_order)) {
+    all_norm_params <- c(preferred_param_order[preferred_param_order %in% all_norm_params],
+                         setdiff(all_norm_params, preferred_param_order))
+  }
+
+  # % stripped; no space before the "(" — matches the butterfly annotations.
+  fmt_w <- function(w) ifelse(w >= 0.01, sprintf("%.0f", 100 * w), "<1")
+  row_blocks <- list()
+  for (p in all_norm_params) {
+    model_idx <- which(vapply(norm_list, function(nv) p %in% nv, logical(1)))
+    if (length(model_idx) == 0L) next
+    w_raw <- weights[model_idx]; total <- sum(w_raw)
+    w_sub <- if (total > 0) w_raw / total else rep(0, length(w_raw))
+    ord   <- order(w_sub, decreasing = TRUE)
+    model_idx <- model_idx[ord]; w_sub <- w_sub[ord]; w_raw <- w_raw[ord]
+    keep_n <- if (total > 0) which(cumsum(w_sub) >= declutter_threshold)[1L] else NA_integer_
+    if (is.na(keep_n)) keep_n <- length(w_sub)
+    model_idx <- model_idx[seq_len(keep_n)]; w_raw <- w_raw[seq_len(keep_n)]
+    keep_mw   <- w_raw >= min_weight                 # drop <1% models
+    model_idx <- model_idx[keep_mw]; w_raw <- w_raw[keep_mw]
+    for (k in seq_along(model_idx)) {
+      i  <- model_idx[k]; nm <- fit_names[i]
+      rc <- names(norm_list[[i]])[norm_list[[i]] == p][1L]
+      row_blocks[[length(row_blocks) + 1L]] <- data.frame(
+        param = p, fit_name = nm,
+        model_num = sub(".*?([0-9]+)$", "\\1", nm),
+        overall_weight = w_raw[k],
+        estimate = draws_raw[[i]][[rc]],
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  if (length(row_blocks) == 0L) stop("No covariates with contributing models found.")
+  plot_df <- bind_rows(row_blocks)
+
+  ordered_present <- all_norm_params[all_norm_params %in% unique(plot_df$param)]
+  K <- length(ordered_present)
+  param_label_lookup <- setNames(
+    map_parameter_labels(ordered_present, param_labels, lookup_keys = ordered_present),
+    ordered_present
+  )
+
+  # One label per model, in median order, marching RIGHT from an absolute anchor.
+  annot <- plot_df %>%
+    dplyr::group_by(param, fit_name, model_num, overall_weight) %>%
+    dplyr::summarise(median_x = median(estimate), .groups = "drop") %>%
+    dplyr::group_by(param) %>%
+    dplyr::arrange(median_x, .by_group = TRUE) %>%
+    dplyr::mutate(
+      march      = (dplyr::row_number() - 1) * annot_x_gap,
+      label_text = paste0(model_num, "(", fmt_w(overall_weight), ")")
+    ) %>% dplyr::ungroup()
+
+  up_extent   <- band_half
+  row_spacing <- up_extent + band_gap
+  pos <- setNames((K - seq_len(K)) * row_spacing, ordered_present)   # first param on top
+  plot_df$baseline <- pos[plot_df$param]
+  annot$baseline   <- pos[annot$param]
+
+  # Density slabs, all rising UP from the baseline (single survey).
+  slab_polys <- plot_df %>%
+    dplyr::group_by(param, fit_name, baseline) %>%
+    dplyr::group_modify(~{
+      d <- density(.x$estimate, n = slab_n, cut = 0)
+      data.frame(x = d$x, dens = d$y)
+    }) %>% dplyr::ungroup() %>%
+    dplyr::mutate(height = dens / max(dens) * slab_scale)
+  slab_polys$grp <- paste(slab_polys$fit_name, slab_polys$param, sep = "__")
+
+  curve_df <- slab_polys %>% dplyr::mutate(y = baseline + height)
+  poly_df  <- curve_df %>% dplyr::group_by(grp, param) %>%
+    dplyr::group_modify(~ rbind(
+      data.frame(x = .x$x,      y = .x$y),
+      data.frame(x = rev(.x$x), y = rev(.x$baseline))
+    )) %>% dplyr::ungroup()
+
+  y_lim <- c(min(pos) - row_spacing * outer_pad_frac_bottom,
+             max(pos) + row_spacing * outer_pad_frac_top)
+  xq    <- quantile(plot_df$estimate, probs = c(0.005, 0.995), na.rm = TRUE)
+  x_lim <- if (!is.null(x_limits)) x_limits else c(floor(xq[1]), ceiling(xq[2]))
+
+  # Absolute LEFT x of every row's label set.  Auto default lands the LONGEST stack
+  # just inside the right edge; set annot_x to push it further right by hand.
+  max_march <- max(annot$march)
+  anchor_x  <- if (!is.null(annot_x)) annot_x else x_lim[2] - max_march - 0.3
+  annot$label_x <- anchor_x + annot$march
+  annot$label_y <- annot$baseline + annot_y
+
+  p <- ggplot() +
+    geom_hline(yintercept = pos, color = "grey75", linewidth = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    geom_polygon(data = poly_df, aes(x = x, y = y, group = grp),
+                 fill = fill_color, color = NA, alpha = slab_alpha) +
+    geom_path(data = curve_df, aes(x = x, y = y, group = grp),
+              color = "black", linewidth = 0.4) +
+    geom_segment(data = annot,
+                 aes(x = median_x, xend = median_x,
+                     y = baseline, yend = baseline + median_tick_len),
+                 color = median_tick_color, linewidth = median_tick_lw, lineend = "round") +
+    geom_text(data = annot, aes(x = label_x, y = label_y, label = label_text),
+              angle = annot_angle, size = annot_size, family = base_family,
+              hjust = annot_hjust, vjust = annot_vjust, color = "grey20") +
+    coord_cartesian(ylim = y_lim, xlim = x_lim, clip = "off") +
+    scale_x_continuous(name = x_axis_label) +
+    scale_y_continuous(breaks = pos, labels = param_label_lookup[ordered_present],
+                       name = NULL, expand = expansion(mult = 0)) +
+    labs(title = title) +
+    marquee::marquefy_theme(theme_minimal(base_family = base_family)) +
+    theme(
+      # marquee renders **bold**.  It ONLY works because marquefy_theme() above also
+      # marquee-ises the root text element — ggplot2 4.x element inheritance would
+      # otherwise strip the subclass and print the ** literally (as ggtext does).
+      # NOTE: line-centring is NOT done here — marquee ignores both `align` and
+      # `hjust` for the lines inside a block.  It is baked into the label strings
+      # by center_md_lines() in the inputs chunk.
+      axis.text.y        = marquee::element_marquee(size = axis_text_y_size, angle = 30,
+                                                    hjust = 1, lineheight = 1.05),
+      # Must be element_marquee too: with a marquee ROOT text element, a plain
+      # element_text child is PROMOTED to marquee and loses its size, so the x tick
+      # labels render enormous (the giant "-2024" / "0" bug).
+      axis.text.x        = marquee::element_marquee(size = axis_text_x_size),
+      axis.title.x       = marquee::element_marquee(size = axis_title_size),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+
+  # Image height dictated by the covariate axes (not the E&C max height).
+  attr(p, "fig_height_in") <- as.numeric(diff(y_lim)) * band_unit_in + axis_extra_in
+  p
+}
+```
+
+
+COMBINED INPUTS (verbatim)
+```{r combined-inputs}
+combined_patterns_to_exclude <- c(
+  "lprior", "lp_", "swater_year_day", "zs_1_1",
+  ".iteration", ".draw", ".chain",
+  "^shape$", "^Intercept$", "^b_Intercept$"
+)
+
+combined_param_labels <- c(
+  "b_out30_z"                      = "30-day outflow",
+  "b_secchi_z"                     = "Secchi depth",
+  "b_distance_along_channel_z"     = "Distance downstream",
+  "b_distance_along_channel_z:out30_z" = "Distance downstream\nx Outflow",
+  "b_distance_m_z"                 = "Distance off mainstem",
+  "b_distance_m_z:out30_z"         = "Distance off mainstem\nx Outflow",
+  "b_chlorophyll_z"                = "Chlorophyll-a",
+  "b_dox_z"                        = "Dissolved oxygen",
+  "b_start_depth_z"                = "Water depth",
+  "b_Edge_TypeEarthenLevee"        = "**Edge Type**\nEarthen levee [225]\n(ref: Cutbank [169])",
+  "b_Edge_TypeEmergentVegitation"  = "Emergent vegetation [88]",
+  "b_Edge_TypeNaturalEdge"         = "Natural edge [43]",
+  "b_Edge_TypeOpenShoal"           = "Shoal [293]",
+  "b_habitat2020Shoal"             = "**Waterbody Type**\nShoal [319;3473]\n(ref: Distrib [295;740])",
+  "b_habitat2020Terminal"          = "Terminal Channel [204;28]",
+  "b_water_year_day_z"             = "Water year day"
+)
+
+combined_survey_colors <- c(
+  "TPS"  = "#0072B2",
+  "EDSM" = "#D55E00"
+)
+
+combined_preferred_param_order <- c(
+  "b_out30_z",
+  "b_start_depth_z",
+  "b_secchi_z",
+  "b_distance_along_channel_z",
+  "b_distance_along_channel_z:out30_z",
+  "b_distance_m_z",
+  "b_distance_m_z:out30_z",
+  "b_water_year_day_z",
+  "b_chlorophyll_z",
+  "b_dox_z",
+  "b_Edge_TypeEarthenLevee",
+  "b_Edge_TypeEmergentVegitation",
+  "b_Edge_TypeNaturalEdge",
+  "b_Edge_TypeOpenShoal",
+  "b_habitat2020Shoal",
+  "b_habitat2020Terminal"
+)
+
+```
+
+FACET SPEC + COMBINED CONDITIONAL-EFFECTS INPUTS (verbatim)
+```{r facet-cond-inputs}
+facet_spec <- tribble(
+  ~row, ~survey,  ~covariate,
+  # ── Outflow main effect (shared, row 1) ───────────────────────────────────
+  1L,   "tps",    "b_out30_z",
+  1L,   "edsm",   "b_out30_z",
+  # ── Distance downstream ── TPS: main only; EDSM: interaction replaces main ─
+  3L,   "tps",    "b_distance_along_channel_z",
+  3L,   "edsm",   "b_distance_along_channel_z:out30_z",
+  # ── Distance off mainstem ── both surveys: interaction replaces main ───────
+  4L,   "tps",    "b_distance_m_z:out30_z",
+  4L,   "edsm",   "b_distance_m_z:out30_z",
+  # ── Secchi depth (shared, row 4) ──────────────────────────────────────────
+  2L,   "tps",    "b_secchi_z",
+  2L,   "edsm",   "b_secchi_z",
+  # ── Water quality loners: Chlorophyll (TPS) ↔ Dissolved oxygen (EDSM) ─────
+  5L,   "tps",    "b_chlorophyll_z",
+  5L,   "edsm",   "b_dox_z",
+  # ── Habitat/edge loners: Edge Type (TPS) ↔ Water Body Type (EDSM) ─────────
+  6L,   "tps",    "Edge_Type",
+  6L,   "edsm",   "habitat2020"
+)
+
+combined_cond_plot_inputs <- list(
+  # Derived from facet_spec — do not edit these two lines directly
+  tps_selected_params  = facet_spec %>% dplyr::filter(survey == "tps")  %>% dplyr::pull(covariate),
+  edsm_selected_params = facet_spec %>% dplyr::filter(survey == "edsm") %>% dplyr::pull(covariate),
+  facet_spec           = facet_spec,
+
+  # Y-axis group 1 — "wide": shared y range across both surveys, scaled to
+  # the largest effect in this group.  Use the same naming style as above.
+  wide_y_params = c(
+    "b_out30_z"
+#    "b_secchi_z"
+#    "Edge_Type"
+#    "habitat2020"
+  ),
+
+  # Y-axis group 2 — "narrow": all remaining parameters.
+  # NULL = every parameter not listed in wide_y_params shares the narrower range.
+  # Provide an explicit character vector to restrict; any parameter in neither
+  # group is plotted with a free (unconstrained) y-axis.
+  narrow_y_params = NULL,
+
+  # X-axis labels (b_ prefix and reversed interaction order both accepted)
+  param_labels = c(
+    "b_out30_z"                  = "30-day outflow (z-score)",
+    "b_secchi_z"                 = "Secchi depth (z-score)",
+    "b_distance_along_channel_z" = "Distance downstream (z-score)",
+    "b_distance_along_channel_z:out30_z" = "Distance downstream × Outflow",
+    "b_distance_m_z"             = "Distance off mainstem (z-score)",
+    "b_distance_m_z:out30_z"     = "Distance off mainstem × Outflow",
+    "b_chlorophyll_z"            = "Chlorophyll-a (z-score)",
+    "b_dox_z"                    = "Dissolved oxygen (z-score)",
+    "b_start_depth_z"            = "Water Depth (z-score)",
+    "Edge_Type"                  = "Edge Type",
+    "habitat2020"                = "Water Body Type",
+    "b_water_year_day_z"         = "Water year day (z-score)"
+  ),
+  y_axis_label = "Predicted CPUE",
+
+  # Titles
+  tps_title  = "TPS",
+  edsm_title = "EDSM",
+  main_title = "TPS vs EDSM: ensemble conditional effects",
+
+  # Appearance
+  show_facet_subtitles = FALSE,
+  legend_position      = "right",
+
+  # Stacking / CE settings
+  method     = "stacking",
+  re_formula = NA,
+  resolution = 100,
+  probs      = c(0.05, 0.95),
+
+  # Save output
+  output_file   = "output_figs/combined_TPS_EDSM_conditional_effects_kfold",  # no extension — pdf and tiff saved below
+  output_width  = 6.5,
+  output_height = 11
+)
+
+```
+
+CATCH CONDITIONAL-EFFECTS ORIGINAL-SCALE INPUTS (verbatim)
+```{r origscale-inputs}
+tps_z_stats_origscale <- list(
+  out30_z = list(
+    # Outflow converted from cfs to cms (1 cfs = 0.0283168 cms) so the x-axis reads in cms.
+    mean   = mean(tow_12_6_tps_wq_nona$OUT_Moving_Mean_30d, na.rm = TRUE) * 0.0283168,
+    sd     = sd(tow_12_6_tps_wq_nona$OUT_Moving_Mean_30d,   na.rm = TRUE) * 0.0283168,
+    digits = -1   # cms, nearest 10
+  ),
+  secchi_z = list(
+    mean   = mean(tow_12_6_tps_wq_nona$Secchi, na.rm = TRUE),
+    sd     = sd(tow_12_6_tps_wq_nona$Secchi,   na.rm = TRUE),
+    digits =  0   # cm, nearest 1
+  ),
+  chlorophyll_z = list(
+    mean   = mean(tow_12_6_tps_wq_nona$Chlorophyll, na.rm = TRUE),
+    sd     = sd(tow_12_6_tps_wq_nona$Chlorophyll,   na.rm = TRUE),
+    digits =  1   # µg/L, 1 decimal
+  ),
+  distance_along_channel_z = list(
+    mean   = mean(tow_12_6_tps_wq_nona$DistanceAlongChannel, na.rm = TRUE),
+    sd     = sd(tow_12_6_tps_wq_nona$DistanceAlongChannel,   na.rm = TRUE),
+    digits = -3   # m, nearest 1000
+  ),
+  distance_m_z = list(
+    mean   = mean(tow_12_6_tps_wq_nona$Distance_m, na.rm = TRUE),
+    sd     = sd(tow_12_6_tps_wq_nona$Distance_m,   na.rm = TRUE),
+    digits = -3   # m, nearest 1000
+  )
+)
+
+edsm_z_stats_origscale <- list(
+  out30_z = list(
+    # Outflow converted from cfs to cms (1 cfs = 0.0283168 cms) so the x-axis reads in cms.
+    mean   = mean(tow_12_6_edsm_wq_nona$OUT_Moving_Mean_30d, na.rm = TRUE) * 0.0283168,
+    sd     = sd(tow_12_6_edsm_wq_nona$OUT_Moving_Mean_30d,   na.rm = TRUE) * 0.0283168,
+    digits = -1   # cms, nearest 10
+  ),
+  secchi_z = list(
+    mean   = mean(tow_12_6_edsm_wq_nona$Secchi, na.rm = TRUE),
+    sd     = sd(tow_12_6_edsm_wq_nona$Secchi,   na.rm = TRUE),
+    digits =  0   # cm, nearest 1
+  ),
+  dox_z = list(
+    mean   = mean(tow_12_6_edsm_wq_nona$Dissolved_Oxygen, na.rm = TRUE),
+    sd     = sd(tow_12_6_edsm_wq_nona$Dissolved_Oxygen,   na.rm = TRUE),
+    digits =  1   # mg/L, 1 decimal
+  ),
+  distance_along_channel_z = list(
+    mean   = mean(tow_12_6_edsm_wq_nona$DistanceAlongChannel, na.rm = TRUE),
+    sd     = sd(tow_12_6_edsm_wq_nona$DistanceAlongChannel,   na.rm = TRUE),
+    digits = -3   # m, nearest 1000
+  ),
+  distance_m_z = list(
+    mean   = mean(tow_12_6_edsm_wq_nona$Distance_m, na.rm = TRUE),
+    sd     = sd(tow_12_6_edsm_wq_nona$Distance_m,   na.rm = TRUE),
+    digits = -3   # m, nearest 1000
+  )
+)
+
+# ── Inputs: same as z-score version except axis titles drop "(z-score)" ───────
+combined_cond_plot_inputs_origscale <- modifyList(
+  combined_cond_plot_inputs,
+  list(
+    param_labels = c(
+      "b_out30_z"                  = "30-day outflow (cms)",
+      "b_secchi_z"                 = "Secchi depth (cm)",
+      "b_distance_along_channel_z" = "Distance downstream (m)",
+      "b_distance_along_channel_z:out30_z" = "Distance downstream (m)",
+      "b_distance_m_z"             = "Distance off mainstem (m)",
+      "b_distance_m_z:out30_z"     = "Distance off mainstem (m)",
+      "b_chlorophyll_z"            = "Chlorophyll-a (µg/L)",
+      "b_dox_z"                    = "Dissolved oxygen (mg/L)",
+      "b_start_depth_z"            = "Water depth (z-score)",    # no raw stats — keep z label
+      "Edge_Type"                  = "Edge Type",
+      "habitat2020"                = "Water Body Type",
+      "b_water_year_day_z"         = "Water year day (z-score)"  # no raw stats — keep z label
+    ),
+    output_file = "output_figs/combined_TPS_EDSM_conditional_effects_origscale_kfold"  # no extension
+  )
+)
+
+```
+
+FORK-LENGTH CONDITIONAL-EFFECTS INPUTS (verbatim)
+```{r fl-cond-inputs}
+cond_model_inputs_fl <- list(
+  fit_names           = fit_names_tps_fl,
+  method              = "stacking",
+  patterns_to_exclude = fl_patterns_to_exclude,
+  include_regex       = "^b_",
+  resolution          = 100,
+  re_formula          = NA,            # gaussian + (1|Station): epred at RE = 0 is the marginal mean
+  probs               = c(0.05, 0.95)
+)
+
+cond_plot_inputs_fl <- list(
+  # selected + ordered covariates (effect names without the b_ prefix are derived below)
+  selected_params_cond = c(
+    "b_out30_z",
+    "b_start_depth_z",
+    "b_distance_along_channel_z",
+    "b_distance_m_z",
+    "b_water_year_day_z",
+    "Edge_Type"
+  ),
+  preferred_param_order_cond = c(
+    "b_out30_z",
+    "b_start_depth_z",
+    "b_distance_along_channel_z",
+    "b_distance_m_z",
+    "b_water_year_day_z",
+    "Edge_Type"
+  ),
+  # per-panel x-axis labels (keyed by b_ name; remapped to effect names at the call boundary)
+  param_labels = c(
+    "b_out30_z"                  = "30-day outflow (z-score)",
+    "b_start_depth_z"            = "Water depth (z-score)",
+    "b_distance_along_channel_z" = "Distance downstream (z-score)",
+    "b_distance_m_z"             = "Distance off mainstem (z-score)",
+    "b_water_year_day_z"         = "Water year day (z-score)",
+    "Edge_Type"                  = "Edge Type"
+  ),
+  y_axis_label         = "Predicted ForkLength (mm)",
+  main_title           = "TPS fork length: model-averaged conditional effects (K-fold ensemble)",
+  show_facet_subtitles = FALSE,
+  fixed_y_scale        = TRUE,
+  ncol                 = 1,        # stack all facets in a single column
+  nrow                 = NULL,
+  ce_color             = "#0072B2",
+
+  output_file  = "output_figs/TPS_FL_ensemble_conditional_effects_custom_kfold",  # no extension — pdf + tiff saved below
+  output_width = 6,
+  output_height = 16,
+  output_dpi   = 300
+)
+
+```
+
+FORK-LENGTH ORIGINAL-SCALE INPUTS (verbatim; cms + meters back-transforms)
+```{r fl-origscale-inputs}
+fl_recover_zstats <- function(d, orig_col, z_col, digits) {
+  cf <- coef(lm(d[[orig_col]] ~ d[[z_col]]))     # original = sd * z + mean  (R^2 = 1)
+  list(mean = unname(cf[1]), sd = unname(cf[2]), digits = digits)
+}
+fl_origscale_data <- read.csv("data/tps_forklength_data.csv", stringsAsFactors = FALSE)
+
+# digits: negative = round to a power of 10 (e.g. -3 = nearest 1,000); positive = decimals.
+fl_z_stats_origscale <- list(
+  # Outflow back-transformed to cms (1 cfs = 0.0283168 cms): scale the recovered mean/sd.
+  out30_z                  = local({
+    s <- fl_recover_zstats(fl_origscale_data, "OUT_Moving_Mean_30d", "out30_z", -1)
+    s$mean <- s$mean * 0.0283168
+    s$sd   <- s$sd   * 0.0283168
+    s
+  }),
+  # Water depth back-transformed to meters (1 ft = 0.3048 m): scale the recovered mean/sd.
+  start_depth_z            = local({
+    s <- fl_recover_zstats(fl_origscale_data, "Start_Depth", "start_depth_z", 1)
+    s$mean <- s$mean * 0.3048
+    s$sd   <- s$sd   * 0.3048
+    s
+  }),
+  distance_along_channel_z = fl_recover_zstats(fl_origscale_data, "DistanceAlongChannel", "distance_along_channel_z", -3),
+  distance_m_z             = fl_recover_zstats(fl_origscale_data, "Distance_m",           "distance_m_z",             -3),
+  water_year_day_z         = fl_recover_zstats(fl_origscale_data, "water_year_day",       "water_year_day_z",          0)
+)
+
+# Inherit every setting from the z-score inputs; override only the axis titles (units),
+# the main title, and the output path.
+cond_plot_inputs_fl_origscale <- modifyList(cond_plot_inputs_fl, list(
+  param_labels = c(
+    "b_out30_z"                  = "30-day outflow (cms)",
+    "b_start_depth_z"            = "Water depth (m)",
+    "b_distance_along_channel_z" = "Distance downstream (m)",
+    "b_distance_m_z"             = "Distance off mainstem (m)",
+    "b_water_year_day_z"         = "Water year day",
+    "Edge_Type"                  = "Edge Type"
+  ),
+  main_title  = "TPS fork length: model-averaged conditional effects (K-fold ensemble, original-scale x)",
+  output_file = "output_figs/TPS_FL_ensemble_conditional_effects_origscale_kfold"
+))
+
+```
+
+FORK-LENGTH BETA FOREST INPUTS (verbatim)
+```{r fl-forest-inputs}
+fl_forest_inputs <- list(
+  preferred_param_order = c(
+    "b_out30_z",
+    "b_start_depth_z",
+    "b_distance_along_channel_z",
+    "b_distance_m_z",
+    "b_water_year_day_z",
+    "b_Edge_TypeEarthenLevee",
+    "b_Edge_TypeEmergentVegitation",
+    "b_Edge_TypeNaturalEdge",
+    "b_Edge_TypeOpenShoal"
+  ),
+  param_labels = c(
+    "b_out30_z"                     = "30-day outflow",
+    "b_start_depth_z"               = "Water depth",
+    "b_distance_along_channel_z"    = "Distance downstream",
+    "b_distance_m_z"                = "Distance off mainstem",
+    "b_water_year_day_z"            = "Water year day",
+    "b_Edge_TypeEarthenLevee"       = "**Edge Type**\nEarthen levee [46]\n(ref: Cutbank [9])",
+    "b_Edge_TypeEmergentVegitation" = "Emergent vegetation [5]",
+    "b_Edge_TypeNaturalEdge"        = "Natural edge [12]",
+    "b_Edge_TypeOpenShoal"          = "Shoal [62]"
+  ),
+  patterns_to_exclude = fl_patterns_to_exclude,
+  declutter_threshold = 0.95,
+  fill_color          = "#0072B2",
+  x_axis_label        = "Posterior beta estimate (mm change in ForkLength per 1 SD / vs. reference edge)",
+  x_limits            = NULL,
+  slab_n              = 128L,
+  band_gap            = 0.4,
+  annot_angle         = 45,
+
+  # centered-layout knobs
+  centered = list(
+    annot_size     = 3.0,
+    slab_scale     = 1.2,
+    annot_base_gap = 0.15,
+    annot_height   = 2.2,
+    annot_x_gap    = 0.7,
+    annot_shift    = 0.4,
+    annot_hjust    = 0,
+    output_file    = "output_figs/TPS_FL_ensemble_forest_custom_kfold_centered",
+    output_width   = 7.5,
+    output_height  = 12,
+    output_dpi     = 300
+  ),
+
+  # right-side ALT2 layout: diagonal labels marching right from an absolute anchor,
+  # left-justified, sitting low over the baselines
+  right = list(
+    annot_size  = 2.9,
+    slab_scale  = 1.2,    # absolute slab height (band units; keep <= band_half)
+    band_half   = 1.7,    # row upward-extent (sets row spacing on its own)
+    annot_x_gap = 0.9,    # in-cluster rightward spacing between labels (x data units = mm)
+    annot_x     = NULL,   # absolute LEFT x of every row's label set; NULL = auto (right side, inside panel)
+    annot_y     = 0.35,   # label height above the baseline (band units; 0 = on the line)
+    annot_hjust = 0,      # left-justify
+    output_file = "output_figs/TPS_FL_ensemble_forest_custom_kfold_right",
+    output_width  = 9,
+    output_height = 13,
+    output_dpi    = 300
+  )
+)
+
+```
+
+FORK-LENGTH FOREST ALT90 INPUTS
+```{r fl-forest-alt90-inputs}
+# Covariate labels: same paragraph breaks as the butterfly forest — break after
+# "Edge:" and after Distance/Dissolved/Emergent/Terminal — so they fit the 84 mm column.
+.fl_labels_alt90 <- fl_forest_inputs$param_labels
+.fl_labels_alt90 <- sub("Edge: ", "Edge:\n", .fl_labels_alt90, fixed = TRUE)
+for (.w in c("Distance", "Dissolved", "Emergent", "Terminal"))
+  .fl_labels_alt90 <- sub(paste0(.w, " "), paste0(.w, "\n"), .fl_labels_alt90, fixed = TRUE)
+# Same as the butterfly: the axis is marquee::element_marquee, so each "\n" must become
+# a markdown HARD break (two trailing spaces + newline) to render as a line break.  Done last.
+# Centre the lines within each block (NBSP padding — see center_md_lines()).
+.fl_labels_alt90 <- center_md_lines(.fl_labels_alt90, family = "Helvetica", size = 8.5)
+.fl_labels_alt90 <- gsub("\n", "  \n", .fl_labels_alt90, fixed = TRUE)
+names(.fl_labels_alt90) <- names(fl_forest_inputs$param_labels)
+
+fl_forest_alt90_inputs <- list(
+  preferred_param_order = fl_forest_inputs$preferred_param_order,
+  param_labels          = .fl_labels_alt90,
+  patterns_to_exclude   = fl_forest_inputs$patterns_to_exclude,
+  declutter_threshold   = 0.95,
+  min_weight            = 0.01,        # drop <1% models (butterfly parity)
+  fill_color            = fl_forest_inputs$fill_color,
+  x_axis_label          = "Posterior beta estimate (z-score)",
+  x_limits              = c(-18, 19),  # extend RIGHT past the data (~+-13) to open a clear column
+                                       #   for the vertical label stacks (they'd otherwise sit over slabs)
+  slab_n                = 128L,
+
+  # ── geometry: matched to the butterfly for continuity (tune for the FL row count) ──
+  band_half             = 3.0,   # row up-extent; band_half + band_gap = axis spacing (3.4 = butterfly)
+  band_gap              = 0.4,
+  slab_scale            = 1.5,   # curve peak height (= butterfly)
+  outer_pad_frac_top    = 0.8,   # <-- extra TOP room for the vertical 90-degree labels (raise if clipped)
+  outer_pad_frac_bottom = 0.55,
+
+  # ── median hash (black, like the butterfly; adjust length here) ──
+  median_tick_len       = 0.6,
+  median_tick_color     = "black",
+
+  # ── annotations (90-degree, marching right) ──
+  annot_angle           = 90,
+  annot_size            = 2.85,  # ~8.1 pt
+  annot_x_gap           = 1.9,   # <-- INTERLINE SPACING within a stack, in x DATA units (mm here).
+                                 #     Vertical 90-degree glyphs are ~2.8 mm wide, and this mm scale is
+                                 #     ~1.6 mm/unit, so ~1.8 keeps stacked labels from overlapping;
+                                 #     lower it to tighten toward the butterfly look.
+  annot_x               = 11,    # <-- ANCHOR: absolute left x of every stack.  Push RIGHT (toward the
+                                 #     x_limits[2] = 24 edge) as far as fits before the longest stack clips.
+  annot_y               = 0.35,
+
+  # ── fonts ──
+  base_family           = "Helvetica",
+  axis_text_y_size      = 8.5,
+  axis_text_x_size      = 8,
+  axis_title_size       = 9,
+
+  # ── image height is dictated by the axes, not the E&C max height ──
+  band_unit_in          = 0.178, # inches per band unit (butterfly continuity)
+  axis_extra_in         = 0.9,   # fixed inches for x-axis title/labels + margins
+
+  output_file  = "output_figs/TPS_FL_ensemble_forest_custom_kfold_alt90",
+  output_width = 84 / 25.4,      # E&C single-column max width (84 mm)
+  output_dpi   = 600
+)
+```
+
+
+GUARDED EXTRACTION — build the cache once, else load it
+```{r build-or-load-cache}
+if (force_rebuild || !file.exists(cache_path)) {
+  message("Building figure cache — streaming every fit once (this is the slow step) ...")
+
+  # 1) b_* draws + predictive criteria, ONE streaming pass per fit (never all resident).
+  catch_be <- extract_beta_and_criterion(c(fit_names_tps_catch, fit_names_edsm_catch), fit_paths_all)
+  beta_draws_cache   <- catch_be$draws
+  tps_criteria_cache <- catch_be$criteria[fit_names_tps_catch]
+
+  fl_be             <- extract_beta_and_criterion(fit_names_tps_fl, fit_paths_tps_fl)
+  fl_draws_cache    <- fl_be$draws
+  fl_criteria_cache <- fl_be$criteria
+
+  # 2) Precompute ensemble conditional effects (the only fit-touching figure step).
+  #    Catch streams via the lognormal epred; fork length via plain posterior_epred.
+  cond_catch <- list(
+    tps_result  = compute_survey_ce(
+      fit_names_tps_catch, fit_paths_all,
+      combined_cond_plot_inputs$tps_selected_params, tps_criteria_cache,
+      resolution = combined_cond_plot_inputs$resolution,
+      re_formula = combined_cond_plot_inputs$re_formula,
+      probs      = combined_cond_plot_inputs$probs,
+      epred_fn   = epred_marginal_lognormal),
+    edsm_result = compute_survey_ce(
+      fit_names_edsm_catch, fit_paths_all,
+      combined_cond_plot_inputs$edsm_selected_params, edsm_criteria,
+      resolution = combined_cond_plot_inputs$resolution,
+      re_formula = combined_cond_plot_inputs$re_formula,
+      probs      = combined_cond_plot_inputs$probs,
+      epred_fn   = epred_marginal_lognormal)
+  )
+
+  cond_fl <- list(
+    ce_list = compute_survey_ce(
+      fit_names_tps_fl, fit_paths_tps_fl,
+      cond_plot_inputs_fl$selected_params_cond, fl_criteria_cache,
+      resolution = cond_model_inputs_fl$resolution,
+      re_formula = cond_model_inputs_fl$re_formula,
+      probs      = cond_model_inputs_fl$probs,
+      epred_fn   = posterior_epred_plain)$ce
+  )
+
+  meta <- list(
+    built_at       = Sys.time(),
+    catch_selected = list(tps  = combined_cond_plot_inputs$tps_selected_params,
+                          edsm = combined_cond_plot_inputs$edsm_selected_params),
+    fl_selected    = cond_plot_inputs_fl$selected_params_cond,
+    resolution     = combined_cond_plot_inputs$resolution,
+    re_formula     = combined_cond_plot_inputs$re_formula,
+    probs          = combined_cond_plot_inputs$probs
+  )
+
+  figcache <- list(
+    beta_draws_cache = beta_draws_cache, tps_criteria_cache = tps_criteria_cache,
+    fl_draws_cache = fl_draws_cache, fl_criteria_cache = fl_criteria_cache,
+    cond_catch = cond_catch, cond_fl = cond_fl, meta = meta
+  )
+  dir.create(dirname(cache_path), showWarnings = FALSE, recursive = TRUE)
+  saveRDS(figcache, cache_path)
+  message("Figure cache written to ", cache_path)
+} else {
+  figcache <- readRDS(cache_path)
+  message("Loaded figure cache from ", cache_path, " (built ",
+          format(figcache$meta$built_at), "). Set force_rebuild <- TRUE to refresh.")
+}
+
+# Unpack into the names the figure chunks use.
+beta_draws_cache   <- figcache$beta_draws_cache
+tps_criteria_cache <- figcache$tps_criteria_cache
+fl_draws_cache     <- figcache$fl_draws_cache
+fl_criteria_cache  <- figcache$fl_criteria_cache
+cond_catch         <- figcache$cond_catch
+cond_fl            <- figcache$cond_fl
+```
+
+
+FIGURE 1 — Catch conditional effects, original-scale x (combined TPS + EDSM)
+```{r fig-catch-ce-origscale, eval=FALSE, purl=FALSE}
+ens_cond_combined_orig <- combined_cond_effects_plot_cached(
+  tps_result           = cond_catch$tps_result,
+  edsm_result          = cond_catch$edsm_result,
+  wide_y_params        = combined_cond_plot_inputs_origscale$wide_y_params,
+  narrow_y_params      = combined_cond_plot_inputs_origscale$narrow_y_params,
+  param_labels         = combined_cond_plot_inputs_origscale$param_labels,
+  y_axis_label         = combined_cond_plot_inputs_origscale$y_axis_label,
+  tps_title            = combined_cond_plot_inputs_origscale$tps_title,
+  edsm_title           = combined_cond_plot_inputs_origscale$edsm_title,
+  main_title           = combined_cond_plot_inputs_origscale$main_title,
+  show_facet_subtitles = combined_cond_plot_inputs_origscale$show_facet_subtitles,
+  legend_position      = combined_cond_plot_inputs_origscale$legend_position,
+  tps_z_stats          = tps_z_stats_origscale,
+  edsm_z_stats         = edsm_z_stats_origscale,
+  facet_spec           = combined_cond_plot_inputs_origscale$facet_spec
+)
+ens_cond_combined_orig
+ggsave(paste0(combined_cond_plot_inputs_origscale$output_file, ".pdf"),
+       ens_cond_combined_orig, device = "pdf",
+       width = combined_cond_plot_inputs_origscale$output_width,
+       height = combined_cond_plot_inputs_origscale$output_height)
+ggsave(paste0(combined_cond_plot_inputs_origscale$output_file, ".tiff"),
+       ens_cond_combined_orig, device = "tiff", dpi = 600,
+       width = combined_cond_plot_inputs_origscale$output_width,
+       height = combined_cond_plot_inputs_origscale$output_height)
+```
+
+
+FIGURE 3b — ALT4: one-column, journal-sized butterfly forest (Estuaries & Coasts)
+Identical to ALT3 (weight-shaded slabs, angled annotations) EXCEPT sized for the E&C
+single-column footprint (84 mm wide x <= 234 mm tall) with all lettering held at >= 8 pt
+(Helvetica), plus two crowding fixes for the shrink: (1) the median marker is a short
+VERTICAL HASH drawn one-sided into each survey's own slab (co-located TPS/EDSM medians
+no longer overlap); (2) long covariate labels get an extra line break (after "Distance",
+"Dissolved", "Emergent", "Terminal") so the y-axis strip fits one column.  Axis spacing
+is uniform; the top and bottom page margins are set independently as fractions of the
+axis spacing (outer_pad_frac_top / outer_pad_frac_bottom).
+The survey legend is centred on the 30-day-outflow axis.  Alpha compositing means DON'T
+export to EPS (transparency is lost) — PDF (vector) + TIFF (600 dpi) only.
+```{r butterfly-alt4-fn}
+combined_cluster_butterfly_plot_alt4 <- function(
+  tps_fit_names,
+  edsm_fit_names,
+  fit_paths,
+  tps_criteria          = NULL,
+  edsm_criteria         = NULL,
+  patterns_to_exclude   = character(0),
+  include_regex         = "^b_",
+  preferred_param_order = NULL,
+  param_labels          = NULL,
+  survey_colors         = c("TPS" = "#0072B2", "EDSM" = "#D55E00"),
+  declutter_threshold   = 0.95,
+  min_weight            = 0.01,   # drop models whose overall stacking weight is < this
+  title                 = NULL,
+  x_axis_label          = "Posterior beta estimate (z-score)",
+  x_limits              = NULL,
+  slab_scale            = 1.5,
+  slab_n                = 128L,
+  band_half             = 1.5,
+  alpha_range           = c(0.12, 0.85),
+  annot_x_gap           = 0.22,
+  annot_size            = 2.85,   # geom_text size in mm; 2.85 mm ~= 8.1 pt (E&C floor is 8 pt)
+  tps_annot_angle       = 45,
+  edsm_annot_angle      = -45,
+  tps_annot_hjust       = 0,
+  edsm_annot_hjust      = 0,
+  tps_annot_x           = 2.0,
+  edsm_annot_x          = 2.0,
+  tps_annot_y           = 0.3,
+  edsm_annot_y          = 0.3,
+  band_gap              = 0.4,
+  show_annotations      = TRUE,   # FALSE drops the per-model number(weight) labels (alt5)
+  median_tick_len       = 0.25,    # length of the median hash (band units), drawn INTO the slab
+  median_tick_color     = "black",   # NULL = colour by survey; e.g. "black" for a single colour
+  outer_pad_frac_top    = 0.5,    # TOP page margin as a fraction of the uniform axis spacing
+  outer_pad_frac_bottom = 0.5,    # BOTTOM page margin as a fraction (0.5 = half the axis gap)
+  legend_on_param       = "b_out30_z",  # covariate axis the legend is vertically centred on
+  legend_x              = 0.02,   # legend left edge, panel-normalised x (0 = left)
+  legend_y_nudge        = 0,      # + moves legend UP, - moves it DOWN (panel-normalised units)
+  legend_swatch_alpha   = 1,    # opacity of the legend colour swatches (higher = more saturated)
+  legend_text_face      = "bold",# "bold" to embolden the legend labels
+  base_family           = "Helvetica",  # E&C requires Helvetica/Arial
+  axis_text_y_size      = 8.5,    # pt; all lettering kept in the 8-9 pt band
+                                     # ("center" or "left"); the block itself stays
+                                     # right-anchored to the axis via hjust = 1
+  axis_text_x_size      = 8,
+  axis_title_size       = 9,
+  legend_text_size      = 8,
+  draws_cache           = NULL,
+  method                = "stacking"
+) {
+  regex_excl <- if (length(patterns_to_exclude) > 0L)
+    paste(patterns_to_exclude, collapse = "|") else "XXXXXXXX_NOMATCH"
+
+  load_one <- function(nm)
+    if (exists(nm, inherits = TRUE)) get(nm, inherits = TRUE) else readRDS(fit_paths[[nm]])
+
+  build_survey_data <- function(fit_names, criteria) {
+    weights   <- stacking_weights_streamed(fit_names, fit_paths, criteria, method)
+    draws_raw <- vector("list", length(fit_names)); names(draws_raw) <- fit_names
+    norm_list <- vector("list", length(fit_names)); names(norm_list) <- fit_names
+
+    for (nm in fit_names) {
+      df_full <- if (!is.null(draws_cache) && nm %in% names(draws_cache)) {
+        draws_cache[[nm]]
+      } else {
+        f <- load_one(nm); d <- as_draws_df(f); rm(f); gc(verbose = FALSE); d
+      }
+      df       <- df_full %>% dplyr::select(-dplyr::matches(regex_excl))
+      raw_cols <- names(df)[grepl(include_regex, names(df))]
+      nrm      <- normalize_beta_interaction_param(raw_cols)
+      draws_raw[[nm]] <- df[, raw_cols, drop = FALSE]
+      norm_list[[nm]] <- setNames(nrm, raw_cols)
+    }
+
+    all_norm_params <- sort(unique(unlist(lapply(norm_list, unname))))
+    if (!is.null(preferred_param_order)) {
+      all_norm_params <- c(
+        preferred_param_order[preferred_param_order %in% all_norm_params],
+        setdiff(all_norm_params, preferred_param_order)
+      )
+    }
+
+    row_blocks <- list()
+    for (p in all_norm_params) {
+      model_idx <- which(vapply(norm_list, function(nv) p %in% nv, logical(1)))
+      if (length(model_idx) == 0L) next
+
+      w_raw <- weights[model_idx]
+      total <- sum(w_raw)
+      w_sub <- if (total > 0) w_raw / total else rep(0, length(w_raw))
+      ord   <- order(w_sub, decreasing = TRUE)
+      model_idx <- model_idx[ord]; w_sub <- w_sub[ord]; w_raw <- w_raw[ord]
+      keep_n <- if (total > 0) which(cumsum(w_sub) >= declutter_threshold)[1L] else NA_integer_
+      if (is.na(keep_n)) keep_n <- length(w_sub)
+      model_idx <- model_idx[seq_len(keep_n)]
+      w_raw     <- w_raw[seq_len(keep_n)]
+
+      # Also drop any surviving model whose OVERALL weight is below min_weight
+      # (declutter alone can keep a long tail of ~0% models within the top 95%).
+      keep_mw   <- w_raw >= min_weight
+      model_idx <- model_idx[keep_mw]
+      w_raw     <- w_raw[keep_mw]
+
+      for (k in seq_along(model_idx)) {
+        i       <- model_idx[k]
+        nm      <- fit_names[i]
+        raw_col <- names(norm_list[[i]])[norm_list[[i]] == p][1L]
+        row_blocks[[length(row_blocks) + 1L]] <- data.frame(
+          param          = p,
+          fit_name       = nm,
+          model_num      = sub(".*?([0-9]+)$", "\\1", nm),
+          overall_weight = w_raw[k],
+          estimate       = draws_raw[[i]][[raw_col]],
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+    list(
+      data            = if (length(row_blocks) > 0L) bind_rows(row_blocks) else data.frame(),
+      all_norm_params = all_norm_params
+    )
+  }
+
+  tps_res  <- build_survey_data(tps_fit_names,  tps_criteria)
+  edsm_res <- build_survey_data(edsm_fit_names, edsm_criteria)
+
+  tps_data  <- tps_res$data;  tps_data$survey  <- "TPS"
+  edsm_data <- edsm_res$data; edsm_data$survey <- "EDSM"
+  plot_df   <- bind_rows(tps_data, edsm_data)
+
+  all_norm_params <- unique(c(tps_res$all_norm_params, edsm_res$all_norm_params))
+  if (!is.null(preferred_param_order)) {
+    all_norm_params <- c(
+      preferred_param_order[preferred_param_order %in% all_norm_params],
+      setdiff(all_norm_params, preferred_param_order)
+    )
+  }
+
+  param_labels_disp  <- map_parameter_labels(all_norm_params, param_labels,
+                                              lookup_keys = all_norm_params)
+  param_label_lookup <- setNames(param_labels_disp, all_norm_params)
+  plot_df$param_label <- factor(param_label_lookup[plot_df$param],
+                                levels = unique(param_label_lookup[all_norm_params]))
+  plot_df <- plot_df[!is.na(plot_df$param_label), ]
+
+  ordered_present <- all_norm_params[all_norm_params %in% unique(plot_df$param)]
+  K <- length(ordered_present)
+
+  fmt_w <- function(w) ifelse(w >= 0.01, sprintf("%.0f", 100 * w), "<1")
+
+  annot_rel <- plot_df %>%
+    dplyr::group_by(param, survey, fit_name, model_num, overall_weight) %>%
+    dplyr::summarise(median_x = median(estimate), .groups = "drop") %>%
+    dplyr::group_by(param, survey) %>%
+    dplyr::arrange(median_x, .by_group = TRUE) %>%
+    dplyr::mutate(
+      label_x    = ifelse(survey == "TPS", tps_annot_x, edsm_annot_x) +
+                   (dplyr::row_number() - 1) * annot_x_gap,
+      label_text = paste0(model_num, "(", fmt_w(overall_weight), ")")
+    ) %>%
+    dplyr::ungroup()
+
+  # Uniform, even spacing between every covariate axis: each row gets the same
+  # band (row_spacing = 2*band_half + band_gap), so baselines are equally spaced.
+  half_extent <- band_half
+  row_spacing <- 2 * half_extent + band_gap
+
+  pos <- setNames((K - seq_len(K)) * row_spacing, ordered_present)
+  plot_df$baseline   <- pos[plot_df$param]
+  annot_rel$baseline <- pos[annot_rel$param]
+
+  annot_rel$label_y <- annot_rel$baseline +
+    ifelse(annot_rel$survey == "TPS", tps_annot_y, -edsm_annot_y)
+
+  # median hash: one-sided tick that rises INTO the model's own slab (+ for TPS,
+  # - for EDSM) so co-located TPS/EDSM medians never overlap the way dots did.
+  annot_rel$tick_sgn <- ifelse(annot_rel$survey == "TPS", 1, -1)
+
+  # ── Density slabs — overall_weight carried through for weight-based shading ──
+  slab_polys <- plot_df %>%
+    dplyr::group_by(param, survey, fit_name, baseline, overall_weight) %>%
+    dplyr::group_modify(~{
+      d <- density(.x$estimate, n = slab_n, cut = 0)
+      data.frame(x = d$x, dens = d$y)
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(height = dens / max(dens) * slab_scale)
+
+  slab_polys$sgn <- ifelse(slab_polys$survey == "TPS", 1, -1)
+  slab_polys$grp <- paste(slab_polys$survey, slab_polys$fit_name,
+                          slab_polys$param, sep = "__")
+
+  curve_df <- slab_polys %>%
+    dplyr::mutate(y = baseline + sgn * height)
+
+  poly_df <- curve_df %>%
+    dplyr::group_by(grp, survey, param, overall_weight) %>%
+    dplyr::group_modify(~ rbind(
+      data.frame(x = .x$x,      y = .x$y),
+      data.frame(x = rev(.x$x), y = rev(.x$baseline))
+    )) %>%
+    dplyr::ungroup()
+
+  y_labels <- param_label_lookup[ordered_present]
+  # Top and bottom page margins are independent fractions of the (uniform) axis
+  # spacing.  0.5 => that margin is exactly half the gap between adjacent covariate
+  # axes; raise outer_pad_frac_top for headroom above the top (e.g. tall annotations).
+  y_lim    <- c(min(pos) - row_spacing * outer_pad_frac_bottom,
+                max(pos) + row_spacing * outer_pad_frac_top)
+  xq       <- quantile(plot_df$estimate, probs = c(0.005, 0.995), na.rm = TRUE)
+  x_lim    <- if (!is.null(x_limits)) x_limits else c(floor(xq[1]), ceiling(xq[2]))
+
+  w_max <- max(poly_df$overall_weight, na.rm = TRUE)
+
+  # Legend: vertically centre it on one covariate's axis (default = 30-day
+  # outflow).  Convert that baseline's data-y into panel-normalised [0,1] space,
+  # then apply legend_y_nudge to correct for the panel-vs-plot offset.
+  legend_baseline <- if (legend_on_param %in% names(pos)) pos[[legend_on_param]] else pos[[1]]
+  legend_norm_y   <- (legend_baseline - y_lim[1]) / (y_lim[2] - y_lim[1]) + legend_y_nudge
+
+  # ── Build plot ────────────────────────────────────────────────────────────
+  # Median hash: survey-coloured (median_tick_color = NULL) or a single fixed colour.
+  tick_layer <- if (is.null(median_tick_color)) {
+    geom_segment(data = annot_rel,
+                 aes(x = median_x, xend = median_x,
+                     y = baseline, yend = baseline + tick_sgn * median_tick_len,
+                     color = survey),
+                 linewidth = 0.6, lineend = "round")
+  } else {
+    geom_segment(data = annot_rel,
+                 aes(x = median_x, xend = median_x,
+                     y = baseline, yend = baseline + tick_sgn * median_tick_len),
+                 color = median_tick_color, linewidth = 0.6, lineend = "round")
+  }
+
+  p <- ggplot() +
+    geom_hline(yintercept = pos, color = "grey75", linewidth = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    geom_polygon(
+      data = poly_df,
+      aes(x = x, y = y, group = grp, fill = survey, alpha = overall_weight),
+      color = NA
+    ) +
+    geom_path(
+      data = curve_df,
+      aes(x = x, y = y, group = grp),
+      color = "black", linewidth = 0.4
+    ) +
+    tick_layer
+
+  # Per-model number(weight) annotations — dropped when show_annotations = FALSE (alt5).
+  if (isTRUE(show_annotations)) {
+    p <- p +
+      geom_text(
+        data = dplyr::filter(annot_rel, survey == "TPS"),
+        aes(x = label_x, y = label_y, label = label_text),
+        angle = tps_annot_angle, size = annot_size, family = base_family,
+        hjust = tps_annot_hjust, vjust = 0.5, color = "grey20"
+      ) +
+      geom_text(
+        data = dplyr::filter(annot_rel, survey == "EDSM"),
+        aes(x = label_x, y = label_y, label = label_text),
+        angle = edsm_annot_angle, size = annot_size, family = base_family,
+        hjust = edsm_annot_hjust, vjust = 0.5, color = "grey20"
+      )
+  }
+
+  # Legend labels are rendered by marquee, so bolding is markdown (**TPS**) rather
+  # than a `face` argument, which element_marquee does not have.
+  legend_lab <- if (identical(legend_text_face, "bold")) {
+    function(b) paste0("**", b, "**")
+  } else {
+    function(b) b
+  }
+
+  p <- p +
+    coord_cartesian(ylim = y_lim, xlim = x_lim) +
+    scale_fill_manual(values = survey_colors, name = NULL,
+                      breaks = c("TPS", "EDSM"), labels = legend_lab) +
+    scale_color_manual(values = survey_colors, name = NULL, guide = "none") +
+    scale_alpha_continuous(range = alpha_range, limits = c(0, w_max), guide = "none") +
+    guides(fill = guide_legend(override.aes = list(alpha = legend_swatch_alpha), ncol = 1)) +
+    scale_x_continuous(name = x_axis_label) +
+    # expand = 0 on y: no extra padding beyond y_lim, so the top/bottom margins are
+    # EXACTLY row_spacing*outer_pad_frac_top/_bottom (default ggplot 5% expansion would otherwise
+    # inflate them past the between-axis gap and offset the legend centring).
+    scale_y_continuous(breaks = pos, labels = y_labels, name = NULL,
+                       expand = expansion(mult = 0)) +
+    labs(title = title) +
+    marquee::marquefy_theme(theme_minimal(base_family = base_family)) +
+    theme(
+      # marquee renders **bold**.  It ONLY works because marquefy_theme() above also
+      # marquee-ises the root text element — ggplot2 4.x element inheritance would
+      # otherwise strip the subclass and print the ** literally (as ggtext does).
+      # NOTE: line-centring is NOT done here — marquee ignores both `align` and
+      # `hjust` for the lines inside a block.  It is baked into the label strings
+      # by center_md_lines() in the inputs chunk.
+      axis.text.y        = marquee::element_marquee(size = axis_text_y_size, angle = 30,
+                                                    hjust = 1, lineheight = 1.05),
+      # Must be element_marquee too: with a marquee ROOT text element, a plain
+      # element_text child is PROMOTED to marquee and loses its size, so the x tick
+      # labels render enormous (the giant "-2024" / "0" bug).
+      axis.text.x        = marquee::element_marquee(size = axis_text_x_size),
+      axis.title.x       = marquee::element_marquee(size = axis_title_size),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      legend.position      = c(legend_x, legend_norm_y),
+      legend.justification = c(0, 0.5),   # left edge, vertically centred on the target axis
+      legend.direction     = "vertical",
+      legend.background    = element_rect(fill = alpha("white", 0.6), color = NA),
+      # element_marquee has no `face` argument — legend bolding is done by wrapping
+      # the legend labels in ** (see legend_lab() above).
+      legend.text          = marquee::element_marquee(size = legend_text_size)
+    )
+
+  p
+}
+```
+
+```{r alt4-inputs}
+# Extra line breaks so long labels fit the 84 mm column: break AFTER these words.
+# (Names are preserved so the b_* -> label lookup still resolves.)
+.labels_alt4 <- combined_param_labels
+for (.w in c("Distance", "Dissolved", "Emergent", "Terminal"))
+  .labels_alt4 <- sub(paste0(.w, " "), paste0(.w, "\n"), .labels_alt4, fixed = TRUE)
+# The y-axis is drawn by marquee::element_marquee so "**Edge Type**" renders bold.
+# In markdown a lone "\n" is only a SOFT break (renders as a space), so every line
+# break must become a HARD break = two trailing spaces before the newline.  Done last,
+# so the breaks inserted above are converted too.  combined_param_labels itself is left
+# untouched — only this copy is markdown-ised.
+# Centre the lines within each block (NBSP padding — see center_md_lines()).
+.labels_alt4 <- center_md_lines(.labels_alt4, family = "Helvetica", size = 8.5)
+.labels_alt4 <- gsub("\n", "  \n", .labels_alt4, fixed = TRUE)
+names(.labels_alt4) <- names(combined_param_labels)
+
+butterfly_forest_alt4_inputs <- list(
+  preferred_param_order = combined_preferred_param_order,
+  param_labels          = .labels_alt4,
+  survey_colors         = combined_survey_colors,
+  declutter_threshold   = 0.95,
+  min_weight            = 0.01,   # drop <1% models to cut annotation clutter at 84 mm
+  x_axis_label          = "Posterior beta estimate (z-score)",
+  patterns_to_exclude   = c(combined_patterns_to_exclude, "^b_ph_z$"),
+  x_limits      = NULL,
+
+  slab_scale    = 1.5,
+  band_half     = 1.5,
+  slab_n        = 128L,
+  band_gap      = 0.4,
+
+  alpha_range   = c(0.12, 0.85),
+
+  # ── Median hash mark (replaces the dot) ───────────────────────────────────
+  median_tick_len = 0.4,   # length of the vertical median tick (band units, into the slab)
+
+  # ── Vertical margins + legend placement ───────────────────────────────────
+  outer_pad_frac_top    = 0.64,   # top margin: extra headroom for the vertical outflow annotations
+                                  # (= the old 0.55 + 0.3 band-units, expressed as a fraction)
+  outer_pad_frac_bottom = 0.55,   # bottom margin = 55% of the uniform axis spacing
+                                  # (a bit of extra room for annotation text)
+  legend_on_param = "b_out30_z",  # legend centred on the 30-day outflow axis
+  legend_x        = 0.02,         # legend left edge (panel-normalised x)
+  legend_y_nudge  = 0,            # fine-tune legend vertical centring (+ up / - down)
+
+  # ── Lettering — all held in the 8-9 pt band (E&C floor is 8 pt) ────────────
+  base_family      = "Helvetica",
+  annot_size       = 2.85,   # ~8.1 pt
+  axis_text_y_size = 8.5,
+  axis_text_x_size = 8,
+  axis_title_size  = 9,
+  legend_text_size = 8,
+
+  # ── Annotation controls ───────────────────────────────────────────────────
+  annot_x_gap      = 0.35,
+  tps_annot_angle  = 90,
+  edsm_annot_angle = -90,
+  tps_annot_hjust  = 0,
+  edsm_annot_hjust = 0,
+
+  tps_annot_x  = 0.75,
+  edsm_annot_x = 2,
+  tps_annot_y  = 0.4,
+  edsm_annot_y = 0.35,
+
+  output_file   = "output_figs/combined_TPS_EDSM_butterfly_forest_alt4_kfold",
+  output_width  = 88  / 25.4,   # 88 mm = 3.465 in.  NOTE: E&C's one-column max is 84 mm —
+                                # at 88 mm the journal may scale the figure down ~5%, which
+                                # would pull the 8 pt lettering under their 8 pt minimum.
+                                # but I will be cropping the figure to 84 mm so this won't be a problem
+  output_height = 234 / 25.4,   # 234 mm = 9.213 in  (E&C max page height)
+  output_dpi    = 600           # combination art (line work + shaded fills) -> 600 dpi
+)
+```
+
+```{r fig-butterfly-alt4}
+butterfly_forest_alt4 <- combined_cluster_butterfly_plot_alt4(
+  tps_fit_names         = fit_names_tps_catch,
+  edsm_fit_names        = fit_names_edsm_catch,
+  fit_paths             = fit_paths_all,
+  tps_criteria          = tps_criteria_cache,
+  edsm_criteria         = edsm_criteria,
+  draws_cache           = beta_draws_cache,
+  patterns_to_exclude   = butterfly_forest_alt4_inputs$patterns_to_exclude,
+  preferred_param_order = butterfly_forest_alt4_inputs$preferred_param_order,
+  param_labels          = butterfly_forest_alt4_inputs$param_labels,
+  survey_colors         = butterfly_forest_alt4_inputs$survey_colors,
+  declutter_threshold   = butterfly_forest_alt4_inputs$declutter_threshold,
+  min_weight            = butterfly_forest_alt4_inputs$min_weight,
+  x_axis_label          = butterfly_forest_alt4_inputs$x_axis_label,
+  x_limits              = butterfly_forest_alt4_inputs$x_limits,
+  slab_scale            = butterfly_forest_alt4_inputs$slab_scale,
+  band_half             = butterfly_forest_alt4_inputs$band_half,
+  slab_n                = butterfly_forest_alt4_inputs$slab_n,
+  alpha_range           = butterfly_forest_alt4_inputs$alpha_range,
+  median_tick_len       = butterfly_forest_alt4_inputs$median_tick_len,
+  outer_pad_frac_top    = butterfly_forest_alt4_inputs$outer_pad_frac_top,
+  outer_pad_frac_bottom = butterfly_forest_alt4_inputs$outer_pad_frac_bottom,
+  legend_on_param       = butterfly_forest_alt4_inputs$legend_on_param,
+  legend_x              = butterfly_forest_alt4_inputs$legend_x,
+  legend_y_nudge        = butterfly_forest_alt4_inputs$legend_y_nudge,
+  base_family           = butterfly_forest_alt4_inputs$base_family,
+  annot_size            = butterfly_forest_alt4_inputs$annot_size,
+  axis_text_y_size      = butterfly_forest_alt4_inputs$axis_text_y_size,
+  axis_text_x_size      = butterfly_forest_alt4_inputs$axis_text_x_size,
+  axis_title_size       = butterfly_forest_alt4_inputs$axis_title_size,
+  legend_text_size      = butterfly_forest_alt4_inputs$legend_text_size,
+  annot_x_gap           = butterfly_forest_alt4_inputs$annot_x_gap,
+  tps_annot_angle       = butterfly_forest_alt4_inputs$tps_annot_angle,
+  edsm_annot_angle      = butterfly_forest_alt4_inputs$edsm_annot_angle,
+  tps_annot_hjust       = butterfly_forest_alt4_inputs$tps_annot_hjust,
+  edsm_annot_hjust      = butterfly_forest_alt4_inputs$edsm_annot_hjust,
+  tps_annot_x           = butterfly_forest_alt4_inputs$tps_annot_x,
+  edsm_annot_x          = butterfly_forest_alt4_inputs$edsm_annot_x,
+  tps_annot_y           = butterfly_forest_alt4_inputs$tps_annot_y,
+  edsm_annot_y          = butterfly_forest_alt4_inputs$edsm_annot_y,
+  band_gap              = butterfly_forest_alt4_inputs$band_gap
+)
+
+butterfly_forest_alt4
+
+ggsave(paste0(butterfly_forest_alt4_inputs$output_file, ".pdf"), butterfly_forest_alt4,
+       device = "pdf", width = butterfly_forest_alt4_inputs$output_width,
+       height = butterfly_forest_alt4_inputs$output_height)
+ggsave(paste0(butterfly_forest_alt4_inputs$output_file, ".tiff"), butterfly_forest_alt4,
+       device = "tiff", dpi = butterfly_forest_alt4_inputs$output_dpi, compression = "lzw",
+       width = butterfly_forest_alt4_inputs$output_width,
+       height = butterfly_forest_alt4_inputs$output_height)
+# Screen-resolution PNG preview at the true 84 x 234 mm footprint (quick review only).
+ggsave(paste0(butterfly_forest_alt4_inputs$output_file, "_preview.png"), butterfly_forest_alt4,
+       device = "png", dpi = 200, width = butterfly_forest_alt4_inputs$output_width,
+       height = butterfly_forest_alt4_inputs$output_height)
+```
+
+
+FIGURE 3c — ALT5: annotation-free butterfly forest (clean variant)
+Same geometry as ALT4 (uniform axis spacing, journal-sized, 30-day-outflow-centred legend)
+but with the per-model number(weight) annotations DROPPED, the median hash marks recoloured
+black and shortened to 75% of the ALT4 length, and a more-saturated, bold legend.  It reuses
+the ALT4 function through cosmetic flags, inheriting every other ALT4 setting via modifyList.
+```{r alt5-inputs}
+butterfly_forest_alt5_inputs <- modifyList(butterfly_forest_alt4_inputs, list(
+  show_annotations      = FALSE,   # drop the per-model number(weight) labels
+  median_tick_len       = 0.45,    # 75% of ALT4's 0.6
+  median_tick_color     = "black", # all median hashes black (not survey-coloured)
+  slab_scale            = 1.875,   # 25% taller curves than ALT4's 1.5 (room freed by dropping labels)
+  outer_pad_frac_top    = 0.5,    # symmetric top/bottom; >= slab_scale/row_spacing so the taller
+  outer_pad_frac_bottom = 0.5,    #   edge slabs don't clip (no annotation headroom needed here)
+  legend_swatch_alpha   = 1,       # fully saturated legend colour swatches
+  legend_text_face      = "bold",  # bold legend labels
+  output_file           = "output_figs/combined_TPS_EDSM_butterfly_forest_alt5_kfold"
+))
+```
+
+```{r fig-butterfly-alt5, eval=FALSE, purl=FALSE}
+butterfly_forest_alt5 <- combined_cluster_butterfly_plot_alt4(
+  tps_fit_names         = fit_names_tps_catch,
+  edsm_fit_names        = fit_names_edsm_catch,
+  fit_paths             = fit_paths_all,
+  tps_criteria          = tps_criteria_cache,
+  edsm_criteria         = edsm_criteria,
+  draws_cache           = beta_draws_cache,
+  patterns_to_exclude   = butterfly_forest_alt5_inputs$patterns_to_exclude,
+  preferred_param_order = butterfly_forest_alt5_inputs$preferred_param_order,
+  param_labels          = butterfly_forest_alt5_inputs$param_labels,
+  survey_colors         = butterfly_forest_alt5_inputs$survey_colors,
+  declutter_threshold   = butterfly_forest_alt5_inputs$declutter_threshold,
+  min_weight            = butterfly_forest_alt5_inputs$min_weight,
+  x_axis_label          = butterfly_forest_alt5_inputs$x_axis_label,
+  x_limits              = butterfly_forest_alt5_inputs$x_limits,
+  slab_scale            = butterfly_forest_alt5_inputs$slab_scale,
+  band_half             = butterfly_forest_alt5_inputs$band_half,
+  slab_n                = butterfly_forest_alt5_inputs$slab_n,
+  alpha_range           = butterfly_forest_alt5_inputs$alpha_range,
+  show_annotations      = butterfly_forest_alt5_inputs$show_annotations,
+  median_tick_len       = butterfly_forest_alt5_inputs$median_tick_len,
+  median_tick_color     = butterfly_forest_alt5_inputs$median_tick_color,
+  outer_pad_frac_top    = butterfly_forest_alt5_inputs$outer_pad_frac_top,
+  outer_pad_frac_bottom = butterfly_forest_alt5_inputs$outer_pad_frac_bottom,
+  legend_on_param       = butterfly_forest_alt5_inputs$legend_on_param,
+  legend_x              = butterfly_forest_alt5_inputs$legend_x,
+  legend_y_nudge        = butterfly_forest_alt5_inputs$legend_y_nudge,
+  legend_swatch_alpha   = butterfly_forest_alt5_inputs$legend_swatch_alpha,
+  legend_text_face      = butterfly_forest_alt5_inputs$legend_text_face,
+  base_family           = butterfly_forest_alt5_inputs$base_family,
+  annot_size            = butterfly_forest_alt5_inputs$annot_size,
+  axis_text_y_size      = butterfly_forest_alt5_inputs$axis_text_y_size,
+  axis_text_x_size      = butterfly_forest_alt5_inputs$axis_text_x_size,
+  axis_title_size       = butterfly_forest_alt5_inputs$axis_title_size,
+  legend_text_size      = butterfly_forest_alt5_inputs$legend_text_size,
+  annot_x_gap           = butterfly_forest_alt5_inputs$annot_x_gap,
+  tps_annot_angle       = butterfly_forest_alt5_inputs$tps_annot_angle,
+  edsm_annot_angle      = butterfly_forest_alt5_inputs$edsm_annot_angle,
+  tps_annot_hjust       = butterfly_forest_alt5_inputs$tps_annot_hjust,
+  edsm_annot_hjust      = butterfly_forest_alt5_inputs$edsm_annot_hjust,
+  tps_annot_x           = butterfly_forest_alt5_inputs$tps_annot_x,
+  edsm_annot_x          = butterfly_forest_alt5_inputs$edsm_annot_x,
+  tps_annot_y           = butterfly_forest_alt5_inputs$tps_annot_y,
+  edsm_annot_y          = butterfly_forest_alt5_inputs$edsm_annot_y,
+  band_gap              = butterfly_forest_alt5_inputs$band_gap
+)
+
+butterfly_forest_alt5
+
+ggsave(paste0(butterfly_forest_alt5_inputs$output_file, ".pdf"), butterfly_forest_alt5,
+       device = "pdf", width = butterfly_forest_alt5_inputs$output_width,
+       height = butterfly_forest_alt5_inputs$output_height)
+ggsave(paste0(butterfly_forest_alt5_inputs$output_file, ".tiff"), butterfly_forest_alt5,
+       device = "tiff", dpi = butterfly_forest_alt5_inputs$output_dpi, compression = "lzw",
+       width = butterfly_forest_alt5_inputs$output_width,
+       height = butterfly_forest_alt5_inputs$output_height)
+# Screen-resolution PNG preview at the true 84 x 234 mm footprint (quick review only).
+ggsave(paste0(butterfly_forest_alt5_inputs$output_file, "_preview.png"), butterfly_forest_alt5,
+       device = "png", dpi = 200, width = butterfly_forest_alt5_inputs$output_width,
+       height = butterfly_forest_alt5_inputs$output_height)
+```
+
+
+FIGURE 4 — Fork-length beta forest (centered + right layouts)
+```{r fig-fl-forest, eval=FALSE, purl=FALSE}
+ci <- fl_forest_inputs$centered
+fl_forest_centered <- tps_fl_cluster_forest(
+  fit_names             = fit_names_tps_fl,
+  fit_paths             = fit_paths_tps_fl,
+  criteria              = fl_criteria_cache,
+  draws_cache           = fl_draws_cache,
+  patterns_to_exclude   = fl_forest_inputs$patterns_to_exclude,
+  preferred_param_order = fl_forest_inputs$preferred_param_order,
+  param_labels          = fl_forest_inputs$param_labels,
+  declutter_threshold   = fl_forest_inputs$declutter_threshold,
+  label_mode            = "centered",
+  fill_color            = fl_forest_inputs$fill_color,
+  x_axis_label          = fl_forest_inputs$x_axis_label,
+  x_limits              = fl_forest_inputs$x_limits,
+  slab_n                = fl_forest_inputs$slab_n,
+  band_gap              = fl_forest_inputs$band_gap,
+  annot_angle           = fl_forest_inputs$annot_angle,
+  annot_size            = ci$annot_size,
+  slab_scale            = ci$slab_scale,
+  annot_base_gap        = ci$annot_base_gap,
+  annot_height          = ci$annot_height,
+  annot_x_gap           = ci$annot_x_gap,
+  annot_shift           = ci$annot_shift,
+  annot_hjust           = ci$annot_hjust
+)
+fl_forest_centered
+ggsave(paste0(ci$output_file, ".pdf"),  fl_forest_centered, device = "pdf",
+       width = ci$output_width, height = ci$output_height)
+ggsave(paste0(ci$output_file, ".tiff"), fl_forest_centered, device = "tiff",
+       dpi = ci$output_dpi, compression = "lzw",
+       width = ci$output_width, height = ci$output_height)
+
+ri <- fl_forest_inputs$right
+fl_forest_right <- tps_fl_cluster_forest(
+  fit_names             = fit_names_tps_fl,
+  fit_paths             = fit_paths_tps_fl,
+  criteria              = fl_criteria_cache,
+  draws_cache           = fl_draws_cache,
+  patterns_to_exclude   = fl_forest_inputs$patterns_to_exclude,
+  preferred_param_order = fl_forest_inputs$preferred_param_order,
+  param_labels          = fl_forest_inputs$param_labels,
+  declutter_threshold   = fl_forest_inputs$declutter_threshold,
+  label_mode            = "right",
+  fill_color            = fl_forest_inputs$fill_color,
+  x_axis_label          = fl_forest_inputs$x_axis_label,
+  x_limits              = fl_forest_inputs$x_limits,
+  slab_n                = fl_forest_inputs$slab_n,
+  band_gap              = fl_forest_inputs$band_gap,
+  annot_angle           = fl_forest_inputs$annot_angle,
+  annot_size            = ri$annot_size,
+  slab_scale            = ri$slab_scale,
+  band_half             = ri$band_half,
+  annot_x_gap           = ri$annot_x_gap,
+  annot_x               = ri$annot_x,
+  annot_y               = ri$annot_y,
+  annot_hjust           = ri$annot_hjust
+)
+fl_forest_right
+ggsave(paste0(ri$output_file, ".pdf"),  fl_forest_right, device = "pdf",
+       width = ri$output_width, height = ri$output_height)
+ggsave(paste0(ri$output_file, ".tiff"), fl_forest_right, device = "tiff",
+       dpi = ri$output_dpi, compression = "lzw",
+       width = ri$output_width, height = ri$output_height)
+```
+
+FIGURE 4b — Fork-length beta forest ALT90 (90-degree annotations, E&C single column)
+```{r fig-fl-forest-alt90}
+ai <- fl_forest_alt90_inputs
+fl_forest_alt90 <- tps_fl_cluster_forest_alt90(
+  fit_names             = fit_names_tps_fl,
+  fit_paths             = fit_paths_tps_fl,
+  criteria              = fl_criteria_cache,
+  draws_cache           = fl_draws_cache,
+  patterns_to_exclude   = ai$patterns_to_exclude,
+  preferred_param_order = ai$preferred_param_order,
+  param_labels          = ai$param_labels,
+  declutter_threshold   = ai$declutter_threshold,
+  min_weight            = ai$min_weight,
+  fill_color            = ai$fill_color,
+  x_axis_label          = ai$x_axis_label,
+  x_limits              = ai$x_limits,
+  slab_n                = ai$slab_n,
+  band_half             = ai$band_half,
+  band_gap              = ai$band_gap,
+  slab_scale            = ai$slab_scale,
+  outer_pad_frac_top    = ai$outer_pad_frac_top,
+  outer_pad_frac_bottom = ai$outer_pad_frac_bottom,
+  median_tick_len       = ai$median_tick_len,
+  median_tick_color     = ai$median_tick_color,
+  annot_angle           = ai$annot_angle,
+  annot_size            = ai$annot_size,
+  annot_x_gap           = ai$annot_x_gap,
+  annot_x               = ai$annot_x,
+  annot_y               = ai$annot_y,
+  base_family           = ai$base_family,
+  axis_text_y_size      = ai$axis_text_y_size,
+  axis_text_x_size      = ai$axis_text_x_size,
+  axis_title_size       = ai$axis_title_size,
+  band_unit_in          = ai$band_unit_in,
+  axis_extra_in         = ai$axis_extra_in
+)
+fl_forest_alt90
+.h_alt90 <- attr(fl_forest_alt90, "fig_height_in")   # height dictated by the covariate axes
+ggsave(paste0(ai$output_file, ".pdf"),  fl_forest_alt90, device = "pdf",
+       width = ai$output_width, height = .h_alt90)
+ggsave(paste0(ai$output_file, ".tiff"), fl_forest_alt90, device = "tiff",
+       dpi = ai$output_dpi, compression = "lzw", width = ai$output_width, height = .h_alt90)
+ggsave(paste0(ai$output_file, "_preview.png"), fl_forest_alt90, device = "png",
+       dpi = 200, width = ai$output_width, height = .h_alt90)
+```
+
+
+
+FIGURE 5 — Fork-length conditional effects, original-scale x (freed water-year-day y-axis)
+```{r fig-fl-ce-origscale, eval=FALSE, purl=FALSE}
+# Re-key the b_-named x-axis labels / order to effect-term names (the cached CE list
+# is keyed by effect names).  Stripping "b_" is sufficient here (Edge_Type has none).
+fl_x_labels <- cond_plot_inputs_fl_origscale$param_labels
+names(fl_x_labels) <- sub("^b_", "", names(fl_x_labels))
+fl_pref <- sub("^b_", "", cond_plot_inputs_fl_origscale$preferred_param_order_cond)
+
+fl_ce_origscale <- plot_fl_ensemble_ce_cached(
+  ensemble_ce_list     = cond_fl$ce_list,
+  preferred_order      = fl_pref,
+  ncol                 = cond_plot_inputs_fl_origscale$ncol,
+  main_title           = cond_plot_inputs_fl_origscale$main_title,
+  x_axis_labels        = fl_x_labels,
+  y_axis_label         = cond_plot_inputs_fl_origscale$y_axis_label,
+  show_facet_subtitles = cond_plot_inputs_fl_origscale$show_facet_subtitles,
+  fixed_y_scale        = cond_plot_inputs_fl_origscale$fixed_y_scale,
+  # Water year day is a CONTROL (accounted for, not a focal predictor of size) and its
+  # ribbon runs down to ~46 mm.  Giving it its own axis keeps the shared range at
+  # 57.6-83.8 for the focal panels; folding it in would widen them to 44.6-85.7 and
+  # flatten the focal effects.
+  free_y_effects       = "water_year_day_z",
+  ce_color             = cond_plot_inputs_fl_origscale$ce_color,
+  z_stats              = fl_z_stats_origscale
+)
+fl_ce_origscale
+ggsave(paste0(cond_plot_inputs_fl_origscale$output_file, ".pdf"),  fl_ce_origscale, device = "pdf",
+       width = cond_plot_inputs_fl_origscale$output_width, height = cond_plot_inputs_fl_origscale$output_height)
+ggsave(paste0(cond_plot_inputs_fl_origscale$output_file, ".tiff"), fl_ce_origscale, device = "tiff",
+       dpi = cond_plot_inputs_fl_origscale$output_dpi, compression = "lzw",
+       width = cond_plot_inputs_fl_origscale$output_width, height = cond_plot_inputs_fl_origscale$output_height)
+```

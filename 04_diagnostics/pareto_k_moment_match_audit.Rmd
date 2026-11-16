@@ -1,0 +1,204 @@
+---
+title: "PSIS-LOO Pareto k audit (moment matching)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 04 — PSIS-LOO reliability audit.**
+>
+> **Purpose.** For every PSIS-LOO-scored TPS fit, reconstructs how many observations had Pareto
+> k > 0.7 before moment matching and how many remained above it afterwards. Nothing is refit.
+>
+> **Inputs.** `fits_tps_wq_Vfix/`, `fits_tps_landscape/`. **Output.** a summary CSV (path in the
+> notebook).
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+Diagnostic companion to `01_tps_catch_models/tps_catch_landscape_models.Rmd` and
+`01_tps_catch_models/tps_catch_wq_models.Rmd`. It answers one question for every saved fit: how many
+observations had Pareto k > 0.7 in the raw PSIS-LOO — i.e. how many actually needed moment
+matching — and how many were still above 0.7 afterwards.
+
+WHY THIS HAS TO BE RECOMPUTED: `loo_moment_match()` overwrites `diagnostics$pareto_k` in place.
+The saved fits (and the `loo_tps*.rds` sidecars) therefore carry only the POST-moment-match k,
+with no record of the pre-MM values and no flag marking which observations were reprocessed. The
+appended `*_output.txt` logs hold only `summary(fit)`, so the pre-MM diagnostics are not stored
+anywhere. They are, however, fully recoverable: `log_lik()` is deterministic given the posterior
+draws already inside each `.rds`, so re-running plain PSIS-LOO on those draws reproduces the
+original pre-moment-match diagnostics exactly. NOTHING IS REFIT HERE — this notebook only reads.
+
+The threshold is 0.7 because `brms:::loo_moment_match.brmsfit` defaults to `k_threshold = 0.7`,
+so "k > 0.7" is exactly "was moment-matched".
+
+The reconstruction self-validates: any fit with zero pre-MM exceedances must show an `elpd_shift`
+of exactly 0, since moment matching had nothing to do. If a zero-exceedance fit shows a non-zero
+shift, the reconstruction is wrong and the table should not be trusted.
+
+Covers the two fit sets reported in the manuscript:
+  * TPS landscape  — `fits_tps_landscape/fit_tps1..10.rds`   (n = 838 tows)
+  * TPS water qual — `fits_tps_wq_Vfix/fit_tps_wq0..13.rds`  (n = 818 tows)
+
+```{r}
+library(brms)
+library(loo)
+
+options(mc.cores = parallel::detectCores())
+```
+
+Config. `OUT_CSV` is a diagnostics table, not a fit — it is written alongside the WQ fits but
+never touches any `fit_*.rds`.
+```{r}
+LANDSCAPE_DIR <- "fits_tps_landscape"
+WQ_DIR        <- "fits_tps_wq_Vfix"
+OUT_CSV       <- file.path(WQ_DIR, "pareto_k_summary.csv")
+
+K_THRESHOLD <- 0.7   # brms loo_moment_match default; "> K_THRESHOLD" == "was moment-matched"
+```
+
+
+###################################
+Audit one fit.
+Recomputes the pre-moment-match PSIS-LOO the same way brms does (log_lik -> relative_eff on the
+exponentiated likelihood -> `loo()`), then reads the stored post-MM k off `fit$criteria$loo`.
+Returns a one-row data frame; drops the ~29 MB fit before returning so peak memory stays flat.
+########################################
+```{r}
+audit_one_fit <- function(path, label, k_threshold = K_THRESHOLD, verbose = TRUE) {
+  fit <- readRDS(path)
+
+  # --- pre-moment-match PSIS-LOO, as brms computes it before loo_moment_match() ---
+  ll       <- log_lik(fit)                       # draws x obs
+  nchains  <- fit$fit@sim$chains
+  chain_id <- rep(seq_len(nchains), each = nrow(ll) / nchains)
+  r_eff    <- loo::relative_eff(exp(ll), chain_id = chain_id)
+  pre      <- loo::loo(ll, r_eff = r_eff)
+  k_pre    <- pre$diagnostics$pareto_k
+
+  # --- post-moment-match k + elpd, as stored on the fit ---
+  has_mm <- !is.null(fit$criteria$loo)
+  k_post <- if (has_mm) fit$criteria$loo$diagnostics$pareto_k else NA_real_
+
+  out <- data.frame(
+    fit             = label,
+    n_obs           = length(k_pre),
+    n_k_gt_thresh   = sum(k_pre > k_threshold),
+    n_k_0.5_thresh  = sum(k_pre > 0.5 & k_pre <= k_threshold),
+    pct_mm          = round(100 * sum(k_pre > k_threshold) / length(k_pre), 3),
+    max_k_pre       = round(max(k_pre), 3),
+    n_k_gt_thresh_post = if (has_mm) sum(k_post > k_threshold) else NA_integer_,
+    pct_post        = if (has_mm) round(100 * sum(k_post > k_threshold) / length(k_pre), 3) else NA_real_,
+    max_k_post      = if (has_mm) round(max(k_post), 3) else NA_real_,
+    elpd_pre        = pre$estimates["elpd_loo", "Estimate"],
+    elpd_post       = if (has_mm) fit$criteria$loo$estimates["elpd_loo", "Estimate"] else NA_real_,
+    stringsAsFactors = FALSE
+  )
+  out$elpd_shift <- round(out$elpd_post - out$elpd_pre, 2)
+
+  if (verbose) {
+    cat(sprintf("%-16s n=%4d  pre k>%.1f: %3d (0.5-%.1f: %3d)  max_k_pre=%.3f  ->  post: %3d  max_k_post=%.3f\n",
+                label, out$n_obs, k_threshold, out$n_k_gt_thresh, k_threshold,
+                out$n_k_0.5_thresh, out$max_k_pre, out$n_k_gt_thresh_post, out$max_k_post))
+  }
+  rm(fit, ll, pre); gc()
+  out
+}
+
+# Audit a whole set of fits given a directory, a filename prefix and the fit numbers.
+audit_fit_set <- function(dir, prefix, nums, set_label, ...) {
+  rows <- list()
+  for (num in nums) {
+    path <- file.path(dir, sprintf("%s%d.rds", prefix, num))
+    if (!file.exists(path)) { warning("missing fit: ", path); next }
+    r <- audit_one_fit(path, sprintf("%s%d", prefix, num), ...)
+    r$set <- set_label
+    rows[[length(rows) + 1]] <- r
+  }
+  do.call(rbind, rows)
+}
+
+# Sanity check described in the header: zero pre-MM exceedances must mean zero elpd shift.
+check_reconstruction <- function(tab, tol = 1e-6) {
+  clean <- tab[tab$n_k_gt_thresh == 0, ]
+  bad   <- clean[abs(clean$elpd_shift) > tol, ]
+  if (nrow(bad)) {
+    warning("reconstruction suspect for: ", paste(bad$fit, collapse = ", "))
+  } else {
+    message("OK: all ", nrow(clean), " fits with no pre-MM exceedances show zero elpd shift.")
+  }
+  invisible(bad)
+}
+```
+
+
+###################################
+Run the audit.
+Reads every fit once (~29 MB each), so this takes a few minutes for the full 24.
+########################################
+```{r eval=FALSE}
+landscape <- audit_fit_set(LANDSCAPE_DIR, "fit_tps",    1:10, "landscape")
+wq        <- audit_fit_set(WQ_DIR,        "fit_tps_wq", 0:13, "wq")
+
+pareto_k_audit <- rbind(landscape, wq)
+check_reconstruction(pareto_k_audit)
+
+# Reported column order: counts and percentages first, elpd bookkeeping last.
+pareto_k_summary <- pareto_k_audit[, c("set", "fit", "n_obs",
+                                       "n_k_gt_thresh", "pct_mm", "max_k_pre",
+                                       "n_k_gt_thresh_post", "pct_post", "max_k_post",
+                                       "elpd_shift")]
+print(pareto_k_summary, row.names = FALSE)
+
+write.csv(pareto_k_summary, OUT_CSV, row.names = FALSE)
+```
+
+
+###################################
+Set-level totals.
+########################################
+```{r eval=FALSE}
+for (s in unique(pareto_k_audit$set)) {
+  x <- pareto_k_audit[pareto_k_audit$set == s, ]
+  cat(sprintf("%-10s fits=%2d  obs=%5d  needed MM=%2d (%.3f%%)  still k>0.7 after MM=%2d (%.3f%%)  fits affected=%d\n",
+              s, nrow(x), sum(x$n_obs), sum(x$n_k_gt_thresh),
+              100 * sum(x$n_k_gt_thresh) / sum(x$n_obs),
+              sum(x$n_k_gt_thresh_post),
+              100 * sum(x$n_k_gt_thresh_post) / sum(x$n_obs),
+              sum(x$n_k_gt_thresh > 0)))
+}
+```
+
+
+###################################
+Result as run on 2026-08-31 (written to `fits_tps_wq_Vfix/pareto_k_summary.csv`).
+
+Landscape: 1 of 8,380 observations needed moment matching (0.012%), in `fit_tps1` alone
+(max k 0.771); moment matching resolved it. All ten landscape fits end clean.
+
+Water quality: 24 of 11,452 observations needed moment matching (0.210%), spread over 9 of the
+14 fits, worst case 6 observations (0.733%) in `fit_tps_wq8` and `fit_tps_wq9`.
+
+Moment matching did NOT fully resolve three WQ fits:
+  * fit_tps_wq3 — 2 still above 0.7 (max k 0.942)
+  * fit_tps_wq8 — 2 still above 0.7 (max k 0.854)
+  * fit_tps_wq9 — 5 still above 0.7 (max k 1.022)
+Their ELPD estimates are mildly unreliable. All three sit mid-pack in the LOOIC ranking (4th,
+5th, 7th) and none is the selected model, so the model comparison is not driven by them. The one
+worth reporting in the methods is `fit_tps_wq9`: k > 1 means infinite importance-sampling
+variance, so the elpd contribution of those 5 points is effectively unestimated. The top-ranked
+`fit_tps_wq11` and the base `fit_tps_wq0` are both clean (0 exceedances, max k 0.68 / 0.65).
+########################################

@@ -1,0 +1,267 @@
+---
+title: "Fork-length fit 9: response-family comparison"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 03 — fork-length diagnostics (supporting).**
+>
+> **Purpose.** Every fork-length model flagged the DHARMa uniformity (KS) test. This notebook
+> refits the best model (fit 9) under alternative response families and a heteroscedastic
+> variant to test whether the misfit is a distributional-shape problem. Result: it is not —
+> see `fit9_bimodality_diagnosis.Rmd`.
+>
+> **Inputs.** `data/tps_forklength_data.csv`, `fits_tps_fl_kfold/fit_tps_fl_9.rds`.
+> **Outputs.** alternative-family fits and DHARMa / pp_check panels under `fits_tps_fl_kfold/`.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+`fit_tps_fl_9` (and every other fit in `tps_forklength_kfold_models.Rmd`'s 1..19 set)
+flagged on the DHARMa KS/uniformity test — see
+`fits_tps_fl_kfold/DHARMa_diagnostics/fit_tps_fl_dharma_summary.csv` (all 19 fits FLAG on
+`ks_flag`, all pass dispersion/outlier/zero-inflation). Dispersion passing but uniformity failing
+points at distributional shape (skew / non-constant variance) rather than over/under-dispersion,
+so this notebook refits fit 9's predictor set under three alternative response distributions
+(lognormal, skew_normal, Gamma) plus a heteroscedastic (`sigma ~ ...`) gaussian variant, and lines
+up DHARMa panels + `pp_check` for all four against the original gaussian fit.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(brms)
+library(DHARMa)
+library(patchwork)
+library(kableExtra)
+
+options(mc.cores = parallel::detectCores())
+```
+
+Config.
+```{r config}
+FIT_DIR      <- "fits_tps_fl_kfold"                         # where fit_tps_fl_9.rds already lives
+OUT_DIR      <- file.path(FIT_DIR, "fit9_family_compare")   # new variants + diagnostics go here
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+n_sim_dharma <- 1000   # same as DHARMa_testing.Rmd, for comparable p-values
+```
+
+Data — identical to the kfold notebook.
+```{r data}
+d_fl <- read_csv("data/tps_forklength_data.csv")
+d_fl$Edge_Type   <- factor(d_fl$Edge_Type)
+d_fl$StationCode <- factor(d_fl$StationCode)
+```
+
+Fit 9's fixed-effects string, transcribed from `fit_defs` in
+`tidal-parr-forklength-analysis2_kfold.Rmd` (`num == 9`):
+`distance_along_channel_z + distance_m_z + start_depth_z + out30_z`.
+```{r formula}
+fit9_fixef <- "distance_along_channel_z + distance_m_z + start_depth_z + out30_z"
+
+mu_rhs   <- paste(fit9_fixef, "+ water_year_day_z + (1|StationCode)")
+mu_form  <- as.formula(paste("ForkLength ~", mu_rhs))
+
+# Same weakly-informative prior as the source fit. Note: for the log-link families
+# (lognormal, Gamma) this prior applies on the log-response scale, not the raw-mm scale,
+# so it is still weakly informative there but not literally "the same" prior in effect.
+fl_priors <- c(set_prior("normal(0,5)", class = "b"))
+
+fit_control <- list(max_treedepth = 10, adapt_delta = 0.95)
+fit_iter    <- 4000
+fit_warmup  <- 2000
+fit_chains  <- 4
+```
+
+Fit-or-load helper — reruns `brm()` only if the cached `.rds` isn't already on disk, so re-running
+this notebook doesn't silently re-trigger a ~4-chain refit.
+```{r fit-or-load}
+fit_or_load <- function(path, formula_obj, family_obj, ...) {
+  if (file.exists(path)) {
+    message("Loading cached fit: ", path)
+    return(readRDS(path))
+  }
+  message("Fitting: ", path)
+  fit <- brm(
+    formula   = formula_obj,
+    family    = family_obj,
+    data      = d_fl,
+    prior     = fl_priors,
+    iter      = fit_iter, warmup = fit_warmup, chains = fit_chains,
+    control   = fit_control,
+    save_pars = save_pars(all = FALSE),
+    ...
+  )
+  saveRDS(fit, path)
+  fit
+}
+```
+
+Refit fit 9 under each alternative. Interactive only — do not knit cold (4 model fits at
+iter = 4000 / warmup = 2000 / chains = 4 each).
+```{r refit-variants, eval=FALSE}
+fit9_lognormal <- fit_or_load(
+  file.path(OUT_DIR, "fit_tps_fl_9_lognormal.rds"),
+  mu_form, lognormal()
+)
+
+fit9_skew <- fit_or_load(
+  file.path(OUT_DIR, "fit_tps_fl_9_skew_normal.rds"),
+  mu_form, skew_normal()
+)
+
+fit9_gamma <- fit_or_load(
+  file.path(OUT_DIR, "fit_tps_fl_9_gamma.rds"),
+  mu_form, Gamma(link = "log")
+)
+
+# Heteroscedastic gaussian: same mean structure, plus a linear model on log(sigma) using
+# the same predictor set (minus the station random intercept, to keep the sigma submodel simple).
+sigma_rhs  <- paste(fit9_fixef, "+ water_year_day_z")
+sigma_form <- bf(mu_form, as.formula(paste("sigma ~", sigma_rhs)))
+
+fit9_sigma <- fit_or_load(
+  file.path(OUT_DIR, "fit_tps_fl_9_sigma_model.rds"),
+  sigma_form, gaussian()
+)
+```
+
+Baseline gaussian fit (already fit in the kfold notebook) + the four new variants, as one named
+list for looped diagnostics.
+```{r assemble}
+fit9_gaussian <- readRDS(file.path(FIT_DIR, "fit_tps_fl_9.rds"))
+
+fits9 <- list(
+  gaussian     = fit9_gaussian,
+  lognormal    = fit9_lognormal,
+  skew_normal  = fit9_skew,
+  gamma        = fit9_gamma,
+  sigma_model  = fit9_sigma
+)
+```
+
+
+## DHARMa summary table across variants
+
+Same tests/flags as `DHARMa_testing.Rmd`, run once per variant on identical `n_sim_dharma`
+simulations.
+```{r dharma-summary, message=FALSE, warning=FALSE}
+pval_flag <- function(p, alpha = 0.05) if (is.na(p) || p < alpha) "FLAG" else "pass"
+
+summarize_dharma <- function(fit, label, n_sim = n_sim_dharma) {
+  set.seed(123)
+  sim <- simulateResiduals(fittedModel = fit, n = n_sim, plot = FALSE)
+
+  t_unif <- testUniformity(sim,    plot = FALSE)
+  t_disp <- testDispersion(sim,    plot = FALSE)
+  t_out  <- testOutliers(sim,      plot = FALSE, type = "bootstrap")
+
+  tibble(
+    fit           = label,
+    ks_stat       = round(t_unif$statistic, 4),
+    ks_p          = round(t_unif$p.value,   4),
+    ks_flag       = pval_flag(t_unif$p.value),
+    disp_ratio    = round(t_disp$statistic, 4),
+    disp_p        = round(t_disp$p.value,   4),
+    disp_flag     = pval_flag(t_disp$p.value),
+    outlier_frac  = round(as.numeric(t_out$statistic) / length(sim$scaledResiduals), 4),
+    outlier_p     = round(t_out$p.value,   4),
+    outlier_flag  = pval_flag(t_out$p.value),
+    any_flag      = if (any(c(ks_flag, disp_flag, outlier_flag) == "FLAG")) "FLAG" else "pass"
+  )
+}
+
+dharma_summary9 <- map2_dfr(fits9, names(fits9), summarize_dharma)
+
+flag_cols <- c("ks_flag", "disp_flag", "outlier_flag", "any_flag")
+dharma_summary9 |>
+  mutate(across(all_of(flag_cols),
+                ~ cell_spec(.x, color = if_else(.x == "FLAG", "red", "black"),
+                            bold = .x == "FLAG"))) |>
+  knitr::kable(format = "html", escape = FALSE, align = "c") |>
+  kableExtra::kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+write_csv(dharma_summary9, file.path(OUT_DIR, "fit_tps_fl_9_family_compare_dharma_summary.csv"))
+```
+
+
+## DHARMa panels, side by side
+
+One row per variant: QQ-uniform plot + residuals-vs-predicted, the two plots that speak most
+directly to the original "bad QQplot" flag. Saved as one combined PNG plus rendered inline.
+```{r dharma-panels, fig.width=9, fig.height=16, message=FALSE, warning=FALSE}
+png(file.path(OUT_DIR, "fit_tps_fl_9_family_compare_qq_resid.png"),
+    width = 1600, height = 2800, res = 200)
+par(mfrow = c(length(fits9), 2), oma = c(0, 1, 2, 1))
+for (label in names(fits9)) {
+  set.seed(123)
+  sim <- simulateResiduals(fittedModel = fits9[[label]], n = n_sim_dharma, plot = FALSE)
+  plotQQunif(sim, main = paste(label, "- QQ"))
+  plotResiduals(sim, main = paste(label, "- resid vs pred"))
+}
+mtext("fit 9 — family / sigma-model comparison", outer = TRUE, cex = 1.2)
+dev.off()
+
+par(mfrow = c(length(fits9), 2), oma = c(0, 1, 2, 1))
+for (label in names(fits9)) {
+  set.seed(123)
+  sim <- simulateResiduals(fittedModel = fits9[[label]], n = n_sim_dharma, plot = FALSE)
+  plotQQunif(sim, main = paste(label, "- QQ"))
+  plotResiduals(sim, main = paste(label, "- resid vs pred"))
+}
+mtext("fit 9 — family / sigma-model comparison", outer = TRUE, cex = 1.2)
+par(mfrow = c(1, 1))
+```
+
+Full 2x2 DHARMa panel (QQ, resid-vs-fitted, dispersion, zero-inflation) per variant, saved
+individually — same layout as `DHARMa_testing.Rmd`'s batch diagnostics.
+```{r dharma-2x2-each, message=FALSE, warning=FALSE}
+for (label in names(fits9)) {
+  set.seed(123)
+  sim <- simulateResiduals(fittedModel = fits9[[label]], n = n_sim_dharma, plot = FALSE)
+
+  png(file.path(OUT_DIR, paste0("fit_tps_fl_9_", label, "_2x2.png")),
+      width = 1800, height = 1400, res = 200)
+  par(mfrow = c(2, 2), oma = c(0, 1, 2, 1))
+  plotQQunif(sim)
+  plotResiduals(sim)
+  testDispersion(sim)
+  testZeroInflation(sim)
+  mtext(paste("fit_tps_fl_9 —", label), outer = TRUE, cex = 1.2)
+  par(mfrow = c(1, 1))
+  dev.off()
+}
+```
+
+
+## pp_check, side by side
+
+`pp_check()` (density overlay of observed vs. posterior-predicted `ForkLength`) for each variant,
+arranged in a grid for direct comparison.
+```{r pp-check-grid, fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+pp_plots <- imap(fits9, function(fit, label) {
+  pp_check(fit, ndraws = 100) +
+    ggtitle(label) +
+    theme(legend.position = "none")
+})
+
+pp_grid <- wrap_plots(pp_plots, ncol = 2) +
+  plot_annotation(title = "fit 9 — pp_check by family / sigma-model variant")
+pp_grid
+
+ggsave(file.path(OUT_DIR, "fit_tps_fl_9_family_compare_pp_check.png"),
+       pp_grid, width = 10, height = 10, dpi = 200)
+```

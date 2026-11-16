@@ -1,0 +1,289 @@
+---
+title: "DHARMa residual diagnostics for the reported model sets"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 04 — residual diagnostics (DHARMa).**
+>
+> **Purpose.** Simulation-based (DHARMa) residual checks for every reported fit: KS uniformity,
+> dispersion, outliers (bootstrap) and zero inflation, with a 2×2 panel per model and a summary
+> table. Knit once per model set by changing `SURVEY` in the `file-index` chunk
+> (`"tps"`, `"edsm"` or `"tps_fl"`).
+>
+> **Inputs.** the saved fits for the chosen set and the CSV they were fitted to.
+> **Outputs.** `<fit dir>/DHARMa_diagnostics/<fit>_2x2.png` and `<prefix>dharma_summary.csv`.
+>
+> **Cost.** ~1 min per TPS model, longer for EDSM (random effects, 4,241 rows).
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+```{r setup, message=FALSE, warning=FALSE}
+library(brms)
+library(DHARMa)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(readr)
+library(patchwork)
+library(kableExtra)
+library(lubridate)
+```
+
+## File index
+
+```{r file-index}
+# Which reported model set to diagnose. Knit once per set:
+#   "tps"    -> TPS catch,       fits_tps_wq_Vfix/fit_tps_wq0..13      (PSIS-LOO set)
+#   "edsm"   -> EDSM catch,      fits_edsm_Vfix/fit_edsm_0..21         (grouped K-fold set)
+#   "tps_fl" -> TPS fork length, fits_tps_fl_kfold/fit_tps_fl_1..19    (LOSO K-fold set)
+SURVEY <- "tps"
+
+cfg <- switch(SURVEY,
+  tps    = list(dir = "fits_tps_wq_Vfix",  root = "fit_tps_wq",  nums = 0:13,
+                dat = "data/tow_12_6_tps_wq_nona.csv"),
+  edsm   = list(dir = "fits_edsm_Vfix",    root = "fit_edsm_",   nums = 0:21,
+                dat = "data/tow_12_6_edsm_wq_nona.csv"),
+  tps_fl = list(dir = "fits_tps_fl_kfold", root = "fit_tps_fl_", nums = 1:19,
+                dat = "data/tps_forklength_data.csv"),
+  stop("SURVEY must be 'tps', 'edsm' or 'tps_fl'"))
+
+fit_dir       <- cfg$dir          # directory containing the fits
+fit_root      <- cfg$root         # filename prefix (before the number)
+fit_filenames <- paste0(fit_dir, "/", fit_root, cfg$nums, ".rds")
+
+# Path to the original data CSV used to fit the models (deep-dive section only)
+dat_path <- cfg$dat
+
+# Number of DHARMa simulations — used identically in batch AND deep-dive
+# so table p-values match plot p-values. Higher = more precise but slower.
+n_sim_dharma <- 1000
+
+# Only keep files that actually exist on disk
+fit_filenames_exist <- fit_filenames[file.exists(fit_filenames)]
+
+cat("Fits found on disk:\n")
+cat(paste(" ", fit_filenames_exist), sep = "\n")
+```
+
+## Batch diagnostics
+
+Run DHARMa for every available fit, store pass/flag results in a summary
+table, and write PNG diagnostics into `<fit_dir>/DHARMa_diagnostics/`.
+
+```{r batch-diagnostics, message=FALSE, warning=FALSE}
+# ── output directory ──────────────────────────────────────────────────────────
+
+diag_base <- file.path(fit_dir, "DHARMa_diagnostics")
+if (!dir.exists(diag_base)) dir.create(diag_base, recursive = TRUE)
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+#' Run DHARMa diagnostics for one brms fit and return a one-row summary tibble.
+#'
+#' @param fit       A fitted brms model.
+#' @param fit_label Character label used in filenames and table (e.g. "fit_edsm_8").
+#' @param out_dir   Directory where PNGs are written.
+#' @param n_sim     Number of DHARMa simulations (higher = more precise).
+#'
+#' @return A one-row tibble with test statistics and pass/flag indicators.
+run_dharma_diagnostics <- function(fit, fit_label, diag_base, n_sim = 1000) {
+
+  # ── simulate residuals ────────────────────────────────────────────────────
+  set.seed(123)
+  sim <- simulateResiduals(fittedModel = fit, n = n_sim, plot = FALSE)
+
+  # ── individual tests ──────────────────────────────────────────────────────
+  t_unif   <- testUniformity(sim,    plot = FALSE)
+  t_disp   <- testDispersion(sim,    plot = FALSE)
+  t_out    <- testOutliers(sim,      plot = FALSE, type = "bootstrap")
+  t_zin    <- testZeroInflation(sim, plot = FALSE)
+
+  # ── summarise ─────────────────────────────────────────────────────────────
+  pval_flag <- function(p, alpha = 0.05) if (is.na(p) || p < alpha) "FLAG" else "pass"
+
+  row <- tibble(
+    fit          = fit_label,
+    ks_stat      = round(t_unif$statistic, 4),
+    ks_p         = round(t_unif$p.value,   4),
+    ks_flag      = pval_flag(t_unif$p.value),
+    disp_ratio   = round(t_disp$statistic, 4),
+    disp_p       = round(t_disp$p.value,   4),
+    disp_flag    = pval_flag(t_disp$p.value),
+    # statistic is count of outliers; divide by nObs to get fraction
+    outlier_frac = round(as.numeric(t_out$statistic) / length(sim$scaledResiduals), 4),
+    outlier_p    = round(t_out$p.value,   4),
+    outlier_flag = pval_flag(t_out$p.value),
+    zi_ratio     = round(t_zin$statistic, 4),
+    zi_p         = round(t_zin$p.value,   4),
+    zi_flag      = pval_flag(t_zin$p.value),
+    any_flag     = if (any(c(ks_flag, disp_flag, outlier_flag, zi_flag) == "FLAG"))
+                     "FLAG" else "pass"
+  )
+
+  # ── 2x2 diagnostic plot saved flat into diag_base ────────────────────────
+  png(file.path(diag_base, paste0(fit_label, "_2x2.png")),
+      width = 1800, height = 1400, res = 200)
+  par(mfrow = c(2, 2), oma = c(0, 1, 2, 1))
+  plotQQunif(sim)
+  plotResiduals(sim)
+  testDispersion(sim)
+  testZeroInflation(sim)
+  mtext(fit_label, outer = TRUE, cex = 1.2)
+  par(mfrow = c(1, 1))
+  dev.off()
+
+  row
+}
+
+# ── batch loop ────────────────────────────────────────────────────────────────
+
+results_list <- vector("list", length(fit_filenames_exist))
+
+for (i in seq_along(fit_filenames_exist)) {
+  fpath <- fit_filenames_exist[i]
+  flabel <- tools::file_path_sans_ext(basename(fpath))   # e.g. "fit_edsm_8"
+
+  message(sprintf("[%d/%d] Running diagnostics for %s ...",
+                  i, length(fit_filenames_exist), flabel))
+
+  fit <- readRDS(fpath)
+
+  results_list[[i]] <- tryCatch(
+    run_dharma_diagnostics(fit, flabel, diag_base, n_sim = n_sim_dharma),
+    error = function(e) {
+      warning(sprintf("Diagnostics failed for %s: %s", flabel, conditionMessage(e)))
+      tibble(fit = flabel, any_flag = "ERROR",
+             ks_stat = NA, ks_p = NA, ks_flag = NA,
+             disp_ratio = NA, disp_p = NA, disp_flag = NA,
+             outlier_frac = NA, outlier_p = NA, outlier_flag = NA,
+             zi_ratio = NA, zi_p = NA, zi_flag = NA)
+    }
+  )
+
+  rm(fit)
+  gc(verbose = FALSE)
+}
+
+diag_summary <- bind_rows(results_list)
+```
+
+## Summary table – at-a-glance
+
+Rows flagged `FLAG` warrant closer inspection in the deep-dive section below.
+
+```{r summary-table}
+# Colour-code in HTML output
+flag_cols <- c("ks_flag", "disp_flag", "outlier_flag", "zi_flag", "any_flag")
+
+diag_summary |>
+  mutate(across(all_of(flag_cols),
+                ~ cell_spec(.x, color = if_else(.x == "FLAG", "red", "black"),
+                            bold = .x == "FLAG"))) |>
+  knitr::kable(format = "html", escape = FALSE, align = "c") |>
+  kableExtra::kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+```{r save-summary}
+summary_file <- file.path(diag_base, paste0(fit_root, "dharma_summary.csv"))
+readr::write_csv(diag_summary, summary_file)
+message("Summary written to ", summary_file)
+```
+
+---
+
+## Deep-dive diagnostics for flagged fits
+
+Re-load a specific fit and run targeted follow-up tests.  Edit `flag_fit` to
+the label you want to inspect (e.g. `"fit_edsm_8"`), then run this chunk.
+
+```{r deep-dive-setup, eval=FALSE}
+flag_fit  <- paste0(fit_root, cfg$nums[1])   # <- change to the fit you want, e.g. "fit_edsm_9"
+flag_path <- file.path(fit_dir, paste0(flag_fit, ".rds"))
+
+stopifnot(file.exists(flag_path))
+fit_dd <- readRDS(flag_path)
+
+set.seed(123)
+sim_dd <- simulateResiduals(fittedModel = fit_dd, n = n_sim_dharma, plot = FALSE)
+
+# Deep-dive outputs go in a per-fit subfolder under diag_base
+dd_dir <- file.path(diag_base, flag_fit)
+if (!dir.exists(dd_dir)) dir.create(dd_dir, recursive = TRUE)
+```
+
+### 2x2 summary plot
+
+```{r dd-2x2, fig.width=10, fig.height=8, eval=FALSE}
+png(file.path(dd_dir, paste0(flag_fit, "_dd_2x2.png")), width = 1800, height = 1400, res = 200)
+par(mfrow = c(2, 2), oma = c(0, 1, 2, 1))
+plotQQunif(sim_dd)
+plotResiduals(sim_dd)
+testDispersion(sim_dd)
+testZeroInflation(sim_dd)
+mtext(paste(flag_fit, "– deep dive"), outer = TRUE, cex = 1.2)
+par(mfrow = c(1, 1))
+dev.off()
+
+par(mfrow = c(2, 2), oma = c(0, 1, 2, 1))
+plotQQunif(sim_dd)
+plotResiduals(sim_dd)
+testDispersion(sim_dd)
+testZeroInflation(sim_dd)
+mtext(paste(flag_fit, "– deep dive"), outer = TRUE, cex = 1.2)
+par(mfrow = c(1, 1))
+```
+
+### Outliers
+
+```{r dd-outliers, eval=FALSE}
+png(file.path(dd_dir, paste0(flag_fit, "_dd_outliers.png")), width = 900, height = 800, res = 150)
+testOutliers(sim_dd, type = "bootstrap")
+dev.off()
+testOutliers(sim_dd, type = "bootstrap")
+```
+
+### Residuals vs each predictor
+
+Swap in the actual data object and predictor names relevant to your model.
+
+```{r dd-residuals-by-predictor, eval=FALSE}
+dat <- readr::read_csv(dat_path) |>
+  mutate(SampleDate = lubridate::mdy(SampleDate))
+
+predictors_to_check <- c("Year", "Julian_day", "Temperature", "Turbidity",
+                          "StationCode", "Secchi")
+
+for (pred in predictors_to_check) {
+  if (pred %in% names(dat)) {
+    plotResiduals(sim_dd, form = dat[[pred]], xlab = pred,
+                  main = paste(flag_fit, "–", pred))
+  }
+}
+```
+
+### Temporal / spatial autocorrelation
+
+```{r dd-autocorrelation, eval=FALSE}
+# dat must already be loaded (run the residuals-by-predictor chunk first)
+testSpatialAutocorrelation(sim_dd,
+                            x = dat$Longitude,
+                            y = dat$Latitude)
+
+testTemporalAutocorrelation(sim_dd, time = dat$SampleDate)  # SampleDate already as.Date()
+```

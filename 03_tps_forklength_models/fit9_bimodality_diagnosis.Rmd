@@ -1,0 +1,483 @@
+---
+title: "Fork-length fit 9: bimodality diagnosis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 03 — fork-length diagnostics (supporting).**
+>
+> **Purpose.** Shows that the persistent S-shaped DHARMa QQ of the fork-length models is
+> bimodality in fork length (hatchery vs natural size composition), locates the grouping
+> variable, and compares split / mixture alternatives. The reported model keeps origin OUT of the
+> model set and lumped; this notebook documents why.
+>
+> **Inputs.** `data/tps_forklength_data.csv`, `fits_tps_fl_kfold/fit_tps_fl_9.rds`.
+> **Outputs.** density figures, comparison fits and `fit9_fixef_comparison.csv` under
+> `fits_tps_fl_kfold/`.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+`fit9_family_comparison.Rmd` swapped fit 9 across gaussian, lognormal (log link,
+multiplicative variance), Gamma (log link, variance ∝ mean²), skew_normal (asymmetry), and a
+distributional `sigma ~ .` variant — additive/multiplicative, symmetric/skewed, and mean-dependent
+variance. **Every one keeps the same S-shaped DHARMa QQ plot.** When the misfit is invariant to that
+much variation in the *conditional distribution*, the conditional distribution is almost certainly
+not the problem. (The `sigma` variant only "passed" residual-vs-predicted by widening the quantile
+envelope, not by removing curvature — a statistic passing for the wrong reason. It's set aside.)
+
+A persistent S-shaped QQ is the classic signature of **bimodal (multimodal) scaled residuals**: the
+empirical CDF rises slowly through the first mode, quickly across the gap, then slowly through the
+second, drawing out an S against the uniform expectation. Every family tried is unimodal, so none can
+reproduce a two-humped conditional distribution — which is why they fail *identically*, and it's
+consistent with dispersion passing (two modes can have the right overall SD but the wrong shape).
+Year classes are already ruled out. This notebook attacks the bimodality directly:
+
+1. Plot raw `ForkLength` density, confirm two modes and locate the gap.
+2. Facet/colour that density by every categorical variable in the data.
+3. Test residuals against each candidate factor with `plotResiduals(sim9, form = factor)`, plus a
+   station-grouped `recalculateResiduals()` view (observation-level vs station-level misfit).
+4. Two pieces of due diligence: measurement **heaping** and unmodelled **mean-structure curvature**.
+5. If a measured covariate cleaves the modes → add it, refit, S-curve should collapse. If nothing
+   measured explains it → fit a principled **two-component gaussian mixture** (`brms` native).
+
+> Note on the `tps` prefix: it denotes the *Tidal Parr Study*, **not** a thin-plate spline. Fit 9 is
+> linear in the z-scored predictors — no `s()` smooth is present — so step 4's curvature check is a
+> genuine, separate hypothesis rather than a re-check of something already in the model.
+
+> **Findings from the rendered run (2026-07-01).** `ForkLength` is clearly two-humped (modes ≈43 and
+> ≈85 mm, gap ≈68). **`ChinookClipped` origin is the grouping variable**: `Natural` fish sit on the
+> lower hump, `Clipped (hatchery)` on the upper, and origin is the *only* candidate flagged by **both**
+> the DHARMa Levene (unequal variance) and within-group-uniformity tests. `shoreline_Class` trips only
+> the uniformity flag; `Gear` and all others are n.s. Curvature check: the residual-vs-predictor
+> *medians are flat* → no missing smooth; the quantile-test flags are the two-mode spread leaking in.
+> Heaping: none (`ForkLength %% 5` ≈ uniform). Station-grouping makes the KS *worse* (D 0.15→0.25) → the
+> split is observation-level, not among-station. Refits: base gaussian KS D=0.150 (p=0.005); **+Origin**
+> D=0.138 (p=0.013); **+Origin & sigma~Origin** D=0.140 (p=0.011, dispersion now perfect, and natural
+> fish confirmed ~1.9× wider: `sigma_OriginNatural`=+0.62 [0.11,1.07] on log scale). So a single binary
+> covariate *reduces but does not clear* the flag — the `Natural` group itself spans both modes and
+> origin is partly confounded with the existing predictors, so the fully principled resolution is the
+> **two-component mixture** (step 5b). Crucially, the ecological fixed effects (distance / depth / out30
+> / water_year_day) are **stable** across all variants — `out30_z` stays ≈ −12.5, every coefficient
+> within its CI — so the KS flag does not threaten the inferential target (step 5c).
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(brms)
+library(DHARMa)
+library(patchwork)
+library(kableExtra)
+
+options(mc.cores = parallel::detectCores())
+```
+
+Config — reuse the family-comparison output area so all of fit 9's exploratory work lives together.
+```{r config}
+FIT_DIR      <- "fits_tps_fl_kfold"                     # where fit_tps_fl_9.rds already lives
+OUT_DIR      <- file.path(FIT_DIR, "fit9_bimodality")   # diagnostics + mixture fit go here
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+n_sim_dharma <- 1000   # same as DHARMa_testing.Rmd / the family-comparison notebook
+```
+
+
+## Data
+
+Loaded and typed identically to the kfold notebook, then `ChinookClipped` is cleaned into a tidy
+2-level **origin** factor (raw values are a mix of `no/No/yes/Yes` plus one `NA`). No modelled
+variable is touched, so row alignment with the fitted model is preserved.
+```{r data}
+d_fl <- read_csv("data/tps_forklength_data.csv")
+d_fl$Edge_Type   <- factor(d_fl$Edge_Type)
+d_fl$StationCode <- factor(d_fl$StationCode)
+
+# Origin: hatchery-clipped vs natural. Case-fold, map to two clean levels, keep NA as NA.
+d_fl <- d_fl |>
+  mutate(
+    Origin = case_when(
+      str_to_lower(ChinookClipped) == "yes" ~ "Clipped (hatchery)",
+      str_to_lower(ChinookClipped) == "no"  ~ "Natural",
+      TRUE                                  ~ NA_character_
+    ),
+    Origin = factor(Origin),
+    Month  = factor(Month)   # treat as categorical for the split check
+  )
+```
+
+Reconstruct the exact rows fit 9 used (drop NA in the response + modelled predictors), so every
+candidate factor lines up 1:1 with the DHARMa residual vector. The `stopifnot` is the guardrail — if
+`brm()` dropped a row we didn't, the whole faceted/`form=` analysis would be silently misaligned.
+```{r model-rows}
+fit9_gaussian <- readRDS(file.path(FIT_DIR, "fit_tps_fl_9.rds"))
+
+model_vars <- c("ForkLength", "distance_along_channel_z", "distance_m_z",
+                "start_depth_z", "out30_z", "water_year_day_z", "StationCode")
+
+d_model <- d_fl |> tidyr::drop_na(all_of(model_vars))
+
+stopifnot(nrow(d_model) == nrow(fit9_gaussian$data))
+message("Modelled rows: ", nrow(d_model), " (matches fit_tps_fl_9$data)")
+```
+
+Candidate grouping variables — the categoricals that could split fork length into two clusters for a
+non-age reason. `Tide` (100/134 NA) and `Target_Caught` (constant) are excluded as unusable.
+```{r candidates}
+candidate_factors <- c(
+  "Origin",              # hatchery-clipped vs natural — top non-age suspect (size dimorphism)
+  "Gear",                # capture method: 4 gears with different size selectivity
+  "Habitat2020",         # habitat split
+  "Region2020",          # spatial split
+  "Edge_Type",           # shoreline edge class (already used by some fits, not fit 9)
+  "shoreline_Class",     # shoreline class
+  "Sac_Water_Year_Type", # water-year type
+  "Month"                # seasonal / growth-stage split
+)
+
+# Cell counts, so tiny-cell factors (e.g. Region2020 has a single Napa row) are read with care.
+purrr::walk(candidate_factors, function(v) {
+  cat("\n== ", v, " ==\n", sep = "")
+  print(table(d_model[[v]], useNA = "ifany"))
+})
+```
+
+
+## Step 1 — raw ForkLength density: confirm the two modes and the gap
+
+```{r raw-density, fig.width=8, fig.height=4, message=FALSE, warning=FALSE}
+gap_guess <- NA_real_   # set after eyeballing, e.g. gap_guess <- 70; used only for the reference line
+
+p_raw <- ggplot(d_model, aes(ForkLength)) +
+  geom_histogram(aes(y = after_stat(density)), binwidth = 3,
+                 fill = "grey80", colour = "white") +
+  geom_density(linewidth = 1) +
+  geom_rug(alpha = 0.5) +
+  { if (!is.na(gap_guess)) geom_vline(xintercept = gap_guess, linetype = 2, colour = "red") } +
+  labs(title = "Raw ForkLength — is it two-humped?",
+       x = "Fork length (mm)", y = "density") +
+  theme_minimal()
+
+p_raw
+ggsave(file.path(OUT_DIR, "fit9_forklength_density_raw.png"), p_raw,
+       width = 8, height = 4, dpi = 200)
+```
+
+
+## Step 2 — density split by each candidate factor
+
+The same density, coloured/faceted by each candidate. Whichever variable cleaves the two modes
+*cleanly* (one hump per level, minimal overlap) is the answer.
+```{r density-by-factor, fig.width=11, fig.height=13, message=FALSE, warning=FALSE}
+density_by <- function(v) {
+  dat <- d_model |> filter(!is.na(.data[[v]]))
+  ggplot(dat, aes(ForkLength, fill = .data[[v]], colour = .data[[v]])) +
+    geom_density(alpha = 0.25, linewidth = 0.7) +
+    geom_rug(aes(colour = .data[[v]]), alpha = 0.5, show.legend = FALSE) +
+    labs(title = v, x = "Fork length (mm)", y = "density",
+         fill = NULL, colour = NULL) +
+    theme_minimal() +
+    theme(legend.position = "bottom", legend.text = element_text(size = 7))
+}
+
+density_grid <- wrap_plots(map(candidate_factors, density_by), ncol = 2) +
+  plot_annotation(title = "ForkLength density split by candidate grouping variable")
+density_grid
+ggsave(file.path(OUT_DIR, "fit9_forklength_density_by_factor.png"), density_grid,
+       width = 11, height = 13, dpi = 200)
+
+# Faceted (small-multiple) view — sometimes reads more cleanly than overlaid densities.
+faceted_by <- function(v) {
+  dat <- d_model |> filter(!is.na(.data[[v]]))
+  ggplot(dat, aes(ForkLength)) +
+    geom_histogram(binwidth = 4, fill = "grey70", colour = "white") +
+    facet_wrap(vars(.data[[v]]), ncol = 1, scales = "free_y") +
+    labs(title = v, x = "Fork length (mm)", y = "count") +
+    theme_minimal()
+}
+```
+
+
+## Step 3 — DHARMa residuals vs each candidate factor
+
+`plotResiduals(sim9, form = factor)` bins the scaled residuals by factor level and runs a
+within-level KS + a Levene homogeneity test: if a factor is driving the misfit, its levels sit at
+systematically different residual locations. Built once here; the gaussian fit is already on disk so
+this is fast.
+```{r sim9}
+set.seed(123)
+sim9 <- simulateResiduals(fittedModel = fit9_gaussian, n = n_sim_dharma, plot = FALSE)
+stopifnot(length(sim9$scaledResiduals) == nrow(d_model))
+```
+
+```{r resid-vs-factor, fig.width=10, fig.height=14, message=FALSE, warning=FALSE}
+png(file.path(OUT_DIR, "fit9_resid_vs_candidate_factors.png"),
+    width = 1900, height = 2600, res = 200)
+par(mfrow = c(ceiling(length(candidate_factors) / 2), 2), oma = c(0, 0, 2, 0))
+for (v in candidate_factors) {
+  # DHARMa drops points with NA in `form`; recode to a visible level so nothing is silently omitted.
+  f <- addNA(factor(d_model[[v]]), ifany = TRUE)
+  plotResiduals(sim9, form = f, main = v, xlab = v)
+}
+mtext("fit 9 — DHARMa residuals vs candidate grouping variables", outer = TRUE, cex = 1.2)
+dev.off()
+
+par(mfrow = c(ceiling(length(candidate_factors) / 2), 2), oma = c(0, 0, 2, 0))
+for (v in candidate_factors) {
+  f <- addNA(factor(d_model[[v]]), ifany = TRUE)
+  plotResiduals(sim9, form = f, main = v, xlab = v)
+}
+mtext("fit 9 — DHARMa residuals vs candidate grouping variables", outer = TRUE, cex = 1.2)
+par(mfrow = c(1, 1))
+```
+
+Station-grouped residuals — is the misfit observation-level or station-level? If aggregating to
+station makes the QQ straighten, the two modes live *between* stations (a spatial/among-station
+split a single random intercept isn't absorbing); if it persists, they live *within* station.
+```{r resid-grouped-station, fig.width=8, fig.height=8, message=FALSE, warning=FALSE}
+sim9_station <- recalculateResiduals(sim9, group = d_model$StationCode)
+
+png(file.path(OUT_DIR, "fit9_resid_grouped_by_station.png"),
+    width = 1600, height = 1600, res = 200)
+plot(sim9_station)
+dev.off()
+
+plot(sim9_station)
+```
+
+
+## Step 4 — due diligence: heaping and mean-structure curvature
+
+**Heaping.** If fork length is recorded to the nearest 5/10 mm the response is effectively
+discretized and no continuous family will ever pass the KS test, independent of bimodality. Quick
+check: the modulo tables and a fine-binned histogram should *not* show a comb.
+```{r heaping, fig.width=8, fig.height=4}
+cat("ForkLength %% 5:\n"); print(table(d_model$ForkLength %% 5))
+cat("\nForkLength %% 10:\n"); print(table(d_model$ForkLength %% 10))
+
+ggplot(d_model, aes(ForkLength)) +
+  geom_histogram(binwidth = 1, fill = "grey30") +
+  labs(title = "Fine-binned ForkLength (1 mm) — comb-like spikes would indicate heaping",
+       x = "Fork length (mm)", y = "count") +
+  theme_minimal()
+# In this dataset the modulo counts are near-uniform -> no heaping; documented, not a defect.
+```
+
+**Mean-structure curvature.** Fit 9 is linear in each z-scored predictor. If a residual-vs-predictor
+plot bows systematically, a real smooth (`s()`) may be missing — a misspecification that can co-occur
+with bimodality. `plotResiduals` overlays quantile-regression lines and flags significant deviation.
+```{r resid-vs-continuous, fig.width=10, fig.height=7, message=FALSE, warning=FALSE}
+cont_preds <- c("distance_along_channel_z", "distance_m_z", "start_depth_z",
+                "out30_z", "water_year_day_z")
+
+png(file.path(OUT_DIR, "fit9_resid_vs_continuous_preds.png"),
+    width = 1900, height = 1300, res = 200)
+par(mfrow = c(2, 3), oma = c(0, 0, 2, 0))
+for (v in cont_preds) plotResiduals(sim9, form = d_model[[v]], main = v, xlab = v)
+mtext("fit 9 — DHARMa residuals vs continuous predictors (curvature check)", outer = TRUE, cex = 1.1)
+dev.off()
+
+par(mfrow = c(2, 3), oma = c(0, 0, 2, 0))
+for (v in cont_preds) plotResiduals(sim9, form = d_model[[v]], main = v, xlab = v)
+mtext("fit 9 — DHARMa residuals vs continuous predictors (curvature check)", outer = TRUE, cex = 1.1)
+par(mfrow = c(1, 1))
+```
+
+
+## Step 5a — if a measured covariate explains the split: add it and refit
+
+If step 2/3 point at one factor (say `Origin`), add it to fit 9's mean structure and re-run the
+DHARMa panel. If bimodality was the mechanism, the S-curve should collapse. Interactive only — this
+is a real 4-chain refit. **Edit `SPLIT_VAR` to whichever variable the diagnostics implicate.**
+```{r refit-with-covariate, eval=FALSE}
+SPLIT_VAR <- "Origin"   # <- set from step 2/3 findings (e.g. "Origin", "Gear", "Habitat2020")
+
+d_split <- d_fl |> tidyr::drop_na(all_of(c(model_vars, SPLIT_VAR)))
+
+fit9_form_base <- ForkLength ~ distance_along_channel_z + distance_m_z + start_depth_z +
+                               out30_z + water_year_day_z + (1 | StationCode)
+fit9_form_split <- update.formula(fit9_form_base, paste(". ~ . +", SPLIT_VAR))
+
+fit9_split_path <- file.path(OUT_DIR, paste0("fit_tps_fl_9_plus_", SPLIT_VAR, ".rds"))
+if (file.exists(fit9_split_path)) {
+  fit9_split <- readRDS(fit9_split_path)
+} else {
+  fit9_split <- brm(
+    formula   = fit9_form_split,
+    family    = gaussian(),
+    data      = d_split,
+    prior     = c(set_prior("normal(0,5)", class = "b")),
+    iter = 4000, warmup = 2000, chains = 4,
+    control   = list(max_treedepth = 10, adapt_delta = 0.95),
+    save_pars = save_pars(all = FALSE)
+  )
+  saveRDS(fit9_split, fit9_split_path)
+}
+
+set.seed(123)
+sim9_split <- simulateResiduals(fit9_split, n = n_sim_dharma, plot = FALSE)
+
+png(file.path(OUT_DIR, paste0("fit_tps_fl_9_plus_", SPLIT_VAR, "_2x2.png")),
+    width = 1800, height = 1400, res = 200)
+par(mfrow = c(2, 2), oma = c(0, 0, 2, 0))
+plotQQunif(sim9_split); plotResiduals(sim9_split)
+testDispersion(sim9_split); testZeroInflation(sim9_split)
+mtext(paste0("fit 9 + ", SPLIT_VAR), outer = TRUE, cex = 1.2)
+par(mfrow = c(1, 1)); dev.off()
+
+pp_check(fit9_split, ndraws = 100) + ggtitle(paste0("fit 9 + ", SPLIT_VAR))
+```
+
+If the split factor also failed the **Levene** (unequal-variance) test — as `Origin` does here — an
+additive intercept can't straighten the QQ on its own. Let `sigma` depend on it too (a "simple"
+gaussian DHARMa still supports). In the rendered run this fixed the dispersion perfectly and confirmed
+`Natural` fish are ~1.9× wider, but the KS flag only eased to D≈0.14 (p≈0.011) — because the `Natural`
+group itself spans both modes. That residual is what the mixture in 5b is for.
+```{r refit-sigma-by-split, eval=FALSE}
+d_split <- d_fl |> tidyr::drop_na(all_of(c(model_vars, SPLIT_VAR)))
+sigma_form <- bf(
+  reformulate(c("distance_along_channel_z", "distance_m_z", "start_depth_z", "out30_z",
+                "water_year_day_z", SPLIT_VAR, "(1 | StationCode)"), response = "ForkLength"),
+  as.formula(paste("sigma ~", SPLIT_VAR))
+)
+fit9_sig_split <- brm(
+  sigma_form, family = gaussian(), data = d_split,
+  prior = c(set_prior("normal(0,5)", class = "b")),
+  iter = 4000, warmup = 2000, chains = 4,
+  control = list(max_treedepth = 10, adapt_delta = 0.95),
+  save_pars = save_pars(all = FALSE)
+)
+saveRDS(fit9_sig_split, file.path(OUT_DIR, paste0("fit_tps_fl_9_", SPLIT_VAR, "_sigma", SPLIT_VAR, ".rds")))
+
+set.seed(123)
+sim9_sig <- simulateResiduals(fit9_sig_split, n = n_sim_dharma, plot = FALSE)
+png(file.path(OUT_DIR, paste0("fit_tps_fl_9_", SPLIT_VAR, "_sigma", SPLIT_VAR, "_2x2.png")),
+    width = 1800, height = 1400, res = 200)
+par(mfrow = c(2, 2), oma = c(0, 0, 2, 0))
+plotQQunif(sim9_sig); plotResiduals(sim9_sig)
+testDispersion(sim9_sig); testZeroInflation(sim9_sig)
+mtext(paste0("fit 9 + ", SPLIT_VAR, ", sigma ~ ", SPLIT_VAR), outer = TRUE, cex = 1.2)
+par(mfrow = c(1, 1)); dev.off()
+```
+
+
+## Step 5b — if nothing measured explains it: two-component gaussian mixture
+
+The principled model for two subpopulations you can't label. `mixture(gaussian, gaussian)` with
+`order = TRUE` constrains the component intercepts (mu1 < mu2) to defeat label switching; the two
+`Intercept` priors are seeded near the visual modes from step 1 so the sampler separates the
+components cleanly. The `(1 | StationCode)` random intercept and the fixed effects are shared across
+both components (one predictor formula → both means), matching fit 9's mean structure. Interactive
+only — mixtures are fiddlier and slower than the family swaps.
+```{r mixture, eval=FALSE}
+# Seed the two component intercepts near the modes you read off the step-1 density.
+# EDIT these two numbers to the low/high humps you actually see.
+mode_lo <- 45
+mode_hi <- 95
+
+mix_form <- bf(
+  ForkLength ~ distance_along_channel_z + distance_m_z + start_depth_z +
+               out30_z + water_year_day_z + (1 | StationCode)
+)
+
+mix_priors <- c(
+  set_prior("normal(0,5)", class = "b"),                                  # shared slopes
+  set_prior(sprintf("normal(%g,20)", mode_lo), class = "Intercept", dpar = "mu1"),
+  set_prior(sprintf("normal(%g,20)", mode_hi), class = "Intercept", dpar = "mu2"),
+  set_prior("dirichlet(2, 2)", class = "theta")                          # mixing proportion
+)
+
+mix_path <- file.path(OUT_DIR, "fit_tps_fl_9_mixture2.rds")
+if (file.exists(mix_path)) {
+  fit9_mix <- readRDS(mix_path)
+} else {
+  fit9_mix <- brm(
+    formula   = mix_form,
+    family    = mixture(gaussian, gaussian, order = TRUE),
+    data      = d_model,
+    prior     = mix_priors,
+    init      = 0,                       # 0-init + ordered intercepts avoids label switching
+    iter = 4000, warmup = 2000, chains = 4,
+    control   = list(max_treedepth = 12, adapt_delta = 0.99),
+    save_pars = save_pars(all = FALSE)
+  )
+  saveRDS(fit9_mix, mix_path)
+}
+
+# DHARMa panel + pp_check: if bimodality was the issue, QQ straightens and pp_check recovers 2 humps.
+# NOTE: DHARMa >= 0.5 supports only "simple" brms models and may refuse a mixture family. If
+# simulateResiduals() errors, build the DHARMa object by hand from brms posterior_predict draws.
+set.seed(123)
+sim9_mix <- tryCatch(
+  simulateResiduals(fit9_mix, n = n_sim_dharma, plot = FALSE),
+  error = function(e) {
+    message("simulateResiduals() rejected the mixture (", conditionMessage(e),
+            ") — falling back to createDHARMa + posterior_predict.")
+    yrep <- brms::posterior_predict(fit9_mix, ndraws = n_sim_dharma)   # draws x obs
+    createDHARMa(
+      simulatedResponse = t(yrep),                                     # obs x draws
+      observedResponse  = fit9_mix$data$ForkLength,
+      fittedPredictedResponse = apply(yrep, 2, median),
+      integerResponse   = FALSE
+    )
+  }
+)
+
+png(file.path(OUT_DIR, "fit_tps_fl_9_mixture2_2x2.png"),
+    width = 1800, height = 1400, res = 200)
+par(mfrow = c(2, 2), oma = c(0, 0, 2, 0))
+plotQQunif(sim9_mix); plotResiduals(sim9_mix)
+testDispersion(sim9_mix); testZeroInflation(sim9_mix)
+mtext("fit 9 — two-component gaussian mixture", outer = TRUE, cex = 1.2)
+par(mfrow = c(1, 1)); dev.off()
+
+pp_check(fit9_mix, ndraws = 100) + ggtitle("fit 9 — 2-component gaussian mixture")
+```
+
+
+## Step 5c — do the ecological conclusions actually move?
+
+The pragmatic test. If the deliverable is the fixed-effect relationships (distance / depth / out30 /
+water_year_day → fork length) rather than calibrated predictive intervals, compare those coefficients
+between the gaussian fit and whichever alternative fixed the QQ. If they're stable, the defensible
+path is to adopt the better model, confirm the estimates hold, and *document* the bimodality as a
+feature of the data — a modest KS flag needn't be disqualifying for an honestly-stated inferential
+target.
+```{r compare-fixef, eval=FALSE}
+fixef_tbl <- function(fit, label) {
+  as.data.frame(fixef(fit)) |>
+    tibble::rownames_to_column("term") |>
+    transmute(term, model = label,
+              est = Estimate, lwr = Q2.5, upr = Q97.5)
+}
+
+# Bind whichever alternatives you actually fit above.
+compare_fixef <- dplyr::bind_rows(
+  fixef_tbl(fit9_gaussian, "gaussian"),
+  if (exists("fit9_split")) fixef_tbl(fit9_split, paste0("+", SPLIT_VAR)),
+  if (exists("fit9_mix"))   fixef_tbl(fit9_mix,   "mixture2")
+)
+
+ggplot(compare_fixef, aes(est, term, colour = model)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+  geom_pointrange(aes(xmin = lwr, xmax = upr),
+                  position = position_dodge(width = 0.5)) +
+  labs(title = "fit 9 fixed effects — gaussian vs. alternatives",
+       subtitle = "if these don't move, the bimodality is a documentable data feature, not a threat",
+       x = "estimate (95% CrI)", y = NULL, colour = NULL) +
+  theme_minimal()
+
+write_csv(compare_fixef, file.path(OUT_DIR, "fit9_fixef_comparison.csv"))
+```

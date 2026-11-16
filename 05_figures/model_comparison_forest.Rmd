@@ -1,0 +1,605 @@
+---
+title: "Model comparison figures: ELPD forest + stacking weights + covariates"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Pipeline step 05 — main-text / supplementary figures: model comparison.**
+>
+> **Purpose.** For each model set, a forest plot of ELPD (±SE) aligned row-for-row with a table
+> of stacking weights and the optional covariates each model carries.
+>
+> **Inputs.** the ELPD comparison CSVs and criteria written by steps 01–03 (no full fits are
+> loaded except the 14 TPS water-quality fits, for their `psis_loo` objects).
+>
+> **Outputs.** `output_figs/model_comparison_*` (PDF, TIFF, PNG).
+>
+> The salinity-included appendix versions (`sal_model_comparison_*`) are produced by
+> `appendix_salinity_temperature_wateryear/A06_salinity_model_comparison_figures.R`, which
+> re-uses the function chunks defined here.
+
+```{r project-root, include=FALSE}
+# Every path in this notebook (data/, fits_*/, output_figs/, cache/) is relative to the
+# REPOSITORY ROOT, not to this file's sub-folder. Walk up from the working directory to the
+# folder holding the .Rproj file, and make knitr (and RStudio's chunk-by-chunk notebook
+# mode) run every chunk from there. Base R only -- no extra package needed.
+find_repo_root <- function(path = getwd()) {
+  p <- normalizePath(path)
+  while (!length(list.files(p, pattern = "\\.Rproj$"))) {
+    if (dirname(p) == p) stop("No .Rproj file found above ", path)
+    p <- dirname(p)
+  }
+  p
+}
+knitr::opts_knit$set(root.dir = find_repo_root())
+```
+For each of three model sets we build one composite figure:
+
+* **Left** – a forest plot of the ELPD estimate for every fit (point = ELPD, bar = ±SE),
+  models ordered best→worst (descending ELPD, best on top).
+* **Right** – a table aligned row-for-row with the forest: a **stacking-weight** column
+  followed by a grid of the **optional covariates**, with a filled box wherever a model
+  includes that covariate.
+
+The three sets and the predictive criterion behind their ELPD:
+
+| folder                | criterion (ELPD)                                  |
+|-----------------------|---------------------------------------------------|
+| `fits_tps_wq_Vfix/`   | PSIS-LOO with moment matching                     |
+| `fits_edsm_Vfix/`     | grouped K-fold CV on `(1 | StationCode)`          |
+| `fits_tps_fl_kfold/`  | grouped K-fold CV on `(1 | StationCode)`          |
+
+Stacking weights are recomputed here **exactly** the way `Ensemble_cod_effect_plots_kfold.Rmd`
+does (the single source of weights for the conditional-effect / forest figures): PSIS-LOO
+sets go through `loo::loo_model_weights(method = "stacking")`; K-fold sets go through
+`loo::stacking_weights()` on the matrix of pointwise `elpd_kfold`. Weights are computed over
+the **full** model set, with no cutoff — so they match the CE and beta-forest plots.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(brms)
+library(loo)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+
+OUT_DIR <- "output_figs"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+# ---- aesthetics (shared across the three figures so they compare cleanly) -----
+FILL_COV    <- "#4C78A8"   # covariate-present cell fill
+FILL_EMPTY  <- "white"     # covariate-absent cell fill
+COL_GRID    <- "grey70"    # covariate grid lines (always visible)
+COL_WBAR    <- "#4C78A8"   # stacking-weight bar
+COL_POINT   <- "grey15"    # forest point / range
+
+# ---- panel widths, in ABSOLUTE inches -----------------------------------------
+# Panels are sized in inches (not relative units), so the forest plot and each
+# covariate column are the SAME physical width in every figure regardless of how
+# many covariate columns a survey has. The saved image width is then just the sum
+# of the panels plus a fixed decoration allowance (y-axis, labels, margins).
+# ADJUST FIGURE WIDTH HERE:
+PANEL_FOREST_IN <- 2.9     # width of the forest (ELPD) panel
+PANEL_WEIGHT_IN <- 0.55    # width of the stacking-weight column
+PANEL_CELL_IN   <- 0.25    # width of ONE covariate column
+PANEL_DECOR_IN  <- 1.30    # fixed non-panel width (forest y-axis + labels + margins)
+```
+
+
+## Stacking-weight helpers (mirror Ensemble_cod_effect_plots_kfold.Rmd)
+
+```{r weight-helpers}
+# Pointwise ELPD out of a stored predictive criterion (psis_loo or kfold).
+.elpd_pointwise <- function(x) {
+  if (inherits(x, "psis_loo")) x$pointwise[, "elpd_loo"]
+  else                          x$pointwise[, "elpd_kfold"]
+}
+
+# Stacking weights over a *named* list of criteria. If every element is a
+# psis_loo object we use loo_model_weights() (the all-PSIS path in the ensemble
+# notebook); otherwise we stack the pointwise elpd matrix directly. Result is a
+# named numeric vector summing to 1 over the full set passed in.
+stacking_weights_from_criteria <- function(crit_list, method = "stacking") {
+  stopifnot(!is.null(names(crit_list)))
+  all_psis <- all(vapply(crit_list, function(x) inherits(x, "psis_loo"), logical(1)))
+  w <- if (all_psis) {
+    loo::loo_model_weights(crit_list, method = method)
+  } else {
+    lpd_mat <- do.call(cbind, lapply(crit_list, .elpd_pointwise))
+    if (method == "pseudobma") loo::pseudobma_weights(lpd_mat)
+    else                       loo::stacking_weights(lpd_mat)
+  }
+  setNames(as.numeric(w), names(crit_list))
+}
+```
+
+
+## Covariate bookkeeping
+
+Each model's fixed-effects *core* (everything except the shared structural terms —
+intercept, `s(water_year_day)` / `water_year_day_z`, `offset(log(Volume))` and the
+`(1 | StationCode)` random intercept) is written out below, transcribed from the fitted
+formulas (`*_output.txt`). `terms()` expands the `*` / `:` interactions to canonical term
+labels, which are then mapped to display names. Encoding the formulas (rather than reading
+the big fits) keeps this notebook fast and makes every model's covariate set auditable.
+
+```{r covariate-defs}
+# raw model term  ->  display label
+COV_LABELS <- c(
+  "out30_z"                              = "Outflow",
+  "distance_along_channel_z"             = "Dist. along",
+  "distance_m_z"                         = "Dist. offshore",
+  "start_depth_z"                        = "Start depth",
+  "habitat2020"                          = "Hydro",
+  "Edge_Type"                            = "Edge type",
+  "secchi_z"                             = "Secchi",
+  "dox_z"                                = "DO",
+  "chlorophyll_z"                        = "Chl-a",
+  "ph_z"                                 = "pH",
+  "out30_z:distance_m_z"                 = "Out × off",
+  "distance_m_z:out30_z"                 = "Out × off",
+  "out30_z:distance_along_channel_z"     = "Out × along",
+  "distance_along_channel_z:out30_z"     = "Out × along"
+)
+
+# Left-to-right order of covariate columns in the table (subset to those present).
+COV_ORDER <- c("Outflow", "Dist. along", "Dist. offshore", "Start depth",
+               "Out × along", "Out × off", "Edge type",
+               "Hydro", "Secchi", "DO", "Chl-a", "pH")
+
+# Expand one core RHS string to display-labelled covariates ("" / "1" -> none).
+core_to_covs <- function(core) {
+  core <- trimws(core)
+  if (!nzchar(core) || core == "1") return(character(0))
+  raw <- attr(terms(as.formula(paste("~", core))), "term.labels")
+  out <- COV_LABELS[raw]
+  if (any(is.na(out))) stop("Unmapped term(s): ", paste(raw[is.na(out)], collapse = ", "))
+  unname(out)
+}
+
+# fit name -> covariate-presence wide data frame (logical cols, ordered).
+build_cov_matrix <- function(cores) {
+  cov_sets <- lapply(cores, core_to_covs)
+  present  <- intersect(COV_ORDER, unique(unlist(cov_sets)))
+  mat <- vapply(cov_sets, function(cs) present %in% cs, logical(length(present)))
+  df  <- as.data.frame(t(mat))
+  names(df) <- present
+  tibble::rownames_to_column(df, "fit")
+}
+```
+
+### Fixed-effects core of every model (from the fitted formulas)
+
+```{r model-cores}
+cores_edsm <- c(
+  fit_edsm_0  = "1",
+  fit_edsm_1  = "out30_z",
+  fit_edsm_2  = "out30_z + distance_along_channel_z",
+  fit_edsm_3  = "out30_z + distance_m_z",
+  fit_edsm_4  = "out30_z + distance_along_channel_z + distance_m_z",
+  fit_edsm_5  = "out30_z * distance_along_channel_z",
+  fit_edsm_6  = "out30_z * distance_m_z",
+  fit_edsm_7  = "out30_z * distance_along_channel_z + distance_m_z",
+  fit_edsm_8  = "out30_z * distance_m_z + distance_along_channel_z",
+  fit_edsm_9  = "out30_z * (distance_m_z + distance_along_channel_z)",
+  fit_edsm_10 = "out30_z * (distance_m_z + distance_along_channel_z) + secchi_z",
+  fit_edsm_11 = "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020 + secchi_z",
+  fit_edsm_12 = "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020 + dox_z",
+  fit_edsm_13 = "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020 + secchi_z + dox_z",
+  fit_edsm_14 = "out30_z * (distance_m_z + distance_along_channel_z) + habitat2020",
+  fit_edsm_15 = "out30_z * (distance_m_z + distance_along_channel_z) + dox_z",
+  fit_edsm_16 = "out30_z * (distance_m_z + distance_along_channel_z) + secchi_z + dox_z",
+  fit_edsm_17 = "out30_z + secchi_z",
+  fit_edsm_18 = "out30_z + distance_m_z + secchi_z",
+  fit_edsm_19 = "out30_z + distance_along_channel_z + secchi_z",
+  fit_edsm_20 = "out30_z * distance_m_z + secchi_z",
+  fit_edsm_21 = "out30_z * distance_along_channel_z + secchi_z"
+)
+
+cores_tps_wq <- c(
+  fit_tps_wq0  = "out30_z * distance_m_z + distance_along_channel_z",
+  fit_tps_wq1  = "out30_z * distance_m_z + distance_along_channel_z + habitat2020",
+  fit_tps_wq2  = "out30_z * distance_m_z + distance_along_channel_z + Edge_Type",
+  fit_tps_wq3  = "out30_z * distance_m_z + distance_along_channel_z + chlorophyll_z",
+  fit_tps_wq4  = "out30_z * distance_m_z + distance_along_channel_z + secchi_z",
+  fit_tps_wq5  = "out30_z * distance_m_z + distance_along_channel_z + dox_z",
+  fit_tps_wq6  = "out30_z * distance_m_z + distance_along_channel_z + ph_z",
+  fit_tps_wq7  = "out30_z * distance_m_z + distance_along_channel_z + Edge_Type + secchi_z",
+  fit_tps_wq8  = "out30_z * distance_m_z + distance_along_channel_z + Edge_Type + chlorophyll_z",
+  fit_tps_wq9  = "out30_z * distance_m_z + distance_along_channel_z + Edge_Type + secchi_z + chlorophyll_z",
+  fit_tps_wq10 = "out30_z + Edge_Type",
+  fit_tps_wq11 = "out30_z + distance_along_channel_z + Edge_Type",
+  fit_tps_wq12 = "out30_z + distance_m_z + Edge_Type",
+  fit_tps_wq13 = "out30_z + distance_m_z + distance_along_channel_z + Edge_Type"
+)
+
+cores_tps_fl <- c(
+  fit_tps_fl_1  = "1",
+  fit_tps_fl_2  = "distance_along_channel_z + distance_m_z + start_depth_z",
+  fit_tps_fl_3  = "distance_m_z + start_depth_z",
+  fit_tps_fl_4  = "distance_along_channel_z + start_depth_z",
+  fit_tps_fl_5  = "distance_along_channel_z + distance_m_z",
+  fit_tps_fl_6  = "distance_along_channel_z",
+  fit_tps_fl_7  = "distance_m_z",
+  fit_tps_fl_8  = "start_depth_z",
+  fit_tps_fl_9  = "distance_along_channel_z + distance_m_z + start_depth_z + out30_z",
+  fit_tps_fl_10 = "distance_along_channel_z + distance_m_z + start_depth_z + Edge_Type",
+  fit_tps_fl_11 = "distance_along_channel_z + distance_m_z + start_depth_z + Edge_Type + out30_z",
+  fit_tps_fl_12 = "distance_m_z + start_depth_z + out30_z",
+  fit_tps_fl_13 = "distance_m_z + start_depth_z + out30_z + Edge_Type",
+  fit_tps_fl_14 = "Edge_Type",
+  fit_tps_fl_15 = "distance_along_channel_z + Edge_Type",
+  fit_tps_fl_16 = "distance_m_z + Edge_Type",
+  fit_tps_fl_17 = "start_depth_z + Edge_Type",
+  fit_tps_fl_18 = "distance_m_z + start_depth_z + Edge_Type",
+  fit_tps_fl_19 = "distance_along_channel_z + distance_m_z + Edge_Type"
+)
+
+# TPS landscape catch (fits_tps_landscape/fit_tps1..10).
+# Labelled fit_tps_landscape1..10 in the figure to distinguish them from fit_tps_wq*.
+cores_tps_landscape <- c(
+  fit_tps_landscape1  = "1",
+  fit_tps_landscape2  = "out30_z",
+  fit_tps_landscape3  = "out30_z + distance_along_channel_z",
+  fit_tps_landscape4  = "out30_z + distance_m_z",
+  fit_tps_landscape5  = "out30_z + distance_along_channel_z + distance_m_z",
+  fit_tps_landscape6  = "out30_z * distance_along_channel_z",
+  fit_tps_landscape7  = "out30_z * distance_m_z",
+  fit_tps_landscape8  = "out30_z * distance_along_channel_z + distance_m_z",
+  fit_tps_landscape9  = "out30_z * distance_m_z + distance_along_channel_z",
+  fit_tps_landscape10 = "out30_z * (distance_along_channel_z + distance_m_z)"
+)
+```
+
+
+## Read ELPD comparisons & compute stacking weights
+
+```{r read-comparisons}
+# Standardise a loo_compare CSV to: fit, elpd_diff, se_diff, elpd, se_elpd.
+read_comparison <- function(path) {
+  d <- read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+  names(d)[1] <- "fit"
+  if ("elpd_loo" %in% names(d)) {
+    d$elpd <- d$elpd_loo;   d$se_elpd <- d$se_elpd_loo
+  } else {
+    d$elpd <- d$elpd_kfold; d$se_elpd <- d$se_elpd_kfold
+  }
+  tibble::as_tibble(d[, c("fit", "elpd_diff", "se_diff", "elpd", "se_elpd")])
+}
+
+```
+
+```{r read-comparisons-data}
+## --- EDSM: K-fold, weights from the pre-bundled criteria (no fits loaded) ----
+edsm_nums  <- 0:21
+edsm_fits  <- paste0("fit_edsm_", edsm_nums)
+edsm_bundle <- readRDS("fits_edsm_Vfix/kfold5_station_criteria_bundle.rds")
+edsm_crit   <- edsm_bundle[edsm_fits]                       # named, full set
+w_edsm      <- stacking_weights_from_criteria(edsm_crit)
+comp_edsm   <- read_comparison("fits_edsm_Vfix/fit_edsm_topmods_catch_kfold5_station_comparisons.csv")
+
+## --- TPS fork length: K-fold, weights from the lightweight kfold sidecars ----
+fl_nums   <- 1:19
+fl_fits   <- paste0("fit_tps_fl_", fl_nums)
+fl_crit   <- setNames(
+  lapply(fl_nums, function(i) readRDS(sprintf("fits_tps_fl_kfold/kfold69_tps_fl_%d.rds", i))),
+  fl_fits
+)
+w_fl      <- stacking_weights_from_criteria(fl_crit)
+comp_fl   <- read_comparison("fits_tps_fl_kfold/fit_tps_fl_kfold69_comparisons.csv")
+
+## --- TPS water-quality: PSIS-LOO (moment matched), weights from fit$criteria$loo
+## These are the only fits we load (small, ~28 MB each); needed for psis_loo objects.
+wq_nums   <- 0:13
+wq_fits   <- paste0("fit_tps_wq", wq_nums)
+wq_crit   <- setNames(
+  lapply(wq_nums, function(i) readRDS(sprintf("fits_tps_wq_Vfix/fit_tps_wq%d.rds", i))$criteria$loo),
+  wq_fits
+)
+w_wq      <- stacking_weights_from_criteria(wq_crit)        # all-PSIS -> loo_model_weights
+comp_wq   <- read_comparison("fits_tps_wq_Vfix/fit_tps_wq1-13_catch_looic_comparisons.csv")
+
+## --- TPS landscape: PSIS-LOO (moment matched), weights from the slim LOO sidecars
+## (loo_tps<n>.rds are psis_loo objects with psis_object dropped; loo_model_weights
+## uses their pointwise elpd_loo, matching the landscape notebook's stacking weights).
+ls_nums   <- 1:10                                          # fits 11-16 excluded
+ls_fits   <- paste0("fit_tps_landscape", ls_nums)
+ls_crit   <- setNames(
+  lapply(ls_nums, function(i) readRDS(sprintf("fits_tps_landscape/loo_tps%d.rds", i))),
+  ls_fits
+)
+w_ls      <- stacking_weights_from_criteria(ls_crit)       # all-PSIS -> loo_model_weights
+comp_ls   <- read_comparison("fits_tps_landscape/fit_tps_landscape1-10_catch_loo_comparisons.csv")
+comp_ls$fit <- paste0("fit_tps_landscape", as.integer(str_extract(comp_ls$fit, "\\d+$")))
+```
+
+
+## Assemble one tidy table per model set
+
+```{r assemble}
+# Join comparison + weights + covariates; order rows best->worst by ELPD; make the
+# shared y factor (model number) used by every panel so the rows line up.
+assemble_group <- function(comp, weights, cores) {
+  covs <- build_cov_matrix(cores)
+  df <- comp %>%
+    mutate(weight    = weights[fit],
+           model_num = as.integer(str_extract(fit, "\\d+$"))) %>%
+    left_join(covs, by = "fit") %>%
+    arrange(elpd_diff) %>%                                  # worst -> best
+    mutate(ylab = factor(model_num, levels = model_num))    # best ends up on top
+  cov_cols <- intersect(COV_ORDER, names(df))
+  list(df = df, cov_cols = cov_cols)
+}
+
+```
+
+```{r assemble-data}
+g_edsm <- assemble_group(comp_edsm, w_edsm, cores_edsm)
+g_wq   <- assemble_group(comp_wq,   w_wq,   cores_tps_wq)
+g_fl   <- assemble_group(comp_fl,   w_fl,   cores_tps_fl)
+g_ls   <- assemble_group(comp_ls,   w_ls,   cores_tps_landscape)
+
+# quick look at the EDSM table
+g_edsm$df %>%
+  arrange(desc(elpd_diff)) %>%
+  select(fit, model_num, elpd, se_elpd, elpd_diff, se_diff, weight) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  print(n = Inf)
+```
+
+
+## Figure builder
+
+```{r figure-builder}
+# x_value = "delta"    -> ELPD difference vs. best model (loo_compare convention; the
+#                          uncertainty that actually separates models). vline at 0.
+#           "absolute" -> raw elpd_loo / elpd_kfold with its own SE. vline at the best.
+#   cell_aspect = physical cell height / width; used to keep the colour fill SQUARE
+#                 (horizontal border is widened relative to the vertical border).
+#   v_border    = vertical border width as a fraction of one cell's width.
+#   style       = "grid"  -> grey grid behind white/colour fills (default).
+#                 "lines" -> grid hidden (white), thin black vertical rules between
+#                            covariate columns. line_lwd sets the rule thickness.
+make_comparison_figure <- function(g, title, criterion_lab,
+                                   x_value = c("delta", "absolute"),
+                                   cell_aspect = 1.2, v_border = 0.10,
+                                   style = c("grid", "lines"), line_lwd = 0.3) {
+  x_value <- match.arg(x_value)
+  style   <- match.arg(style)
+  df <- g$df
+  n  <- nrow(df)
+
+  if (x_value == "delta") {
+    df <- df %>% mutate(xx = elpd_diff, xlo = elpd_diff - se_diff, xhi = elpd_diff + se_diff)
+    xref <- 0; xlab <- expression(Delta * "ELPD  (vs. best model)")
+  } else {
+    df <- df %>% mutate(xx = elpd, xlo = elpd - se_elpd, xhi = elpd + se_elpd)
+    xref <- max(df$elpd); xlab <- "ELPD"
+  }
+
+  base_theme <- theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title.position = "plot",
+          axis.title.x = element_text(size = 9.5),
+          plot.margin = margin(4, 4, 4, 4))
+
+  # VERTICAL ROW ALIGNMENT KNOB. All three panels must share this y padding so the
+  # table rows stay centred on the forest's ELPD points. The discrete forest/weight
+  # axes expand by `y_pad` (range becomes [1 - y_pad, n + y_pad]); the continuous
+  # covariate axis is pinned to that SAME range explicitly (geom_tile would otherwise
+  # train the scale on tile edges and drift). Change in one place only.
+  y_pad   <- 0.6
+  nrow_c  <- nlevels(df$ylab)
+
+  ## ---- left: ELPD forest -----------------------------------------------------
+  p_forest <- ggplot(df, aes(xx, ylab)) +
+    geom_vline(xintercept = xref, linetype = "dashed", colour = "grey55") +
+    geom_linerange(aes(xmin = xlo, xmax = xhi), orientation = "y",
+                   linewidth = 0.5, colour = COL_POINT) +
+    geom_point(size = 1.7, colour = COL_POINT) +
+    scale_y_discrete(expand = expansion(add = y_pad)) +
+    labs(x = xlab, y = "Model #") +
+    base_theme
+
+  ## ---- middle: stacking-weight column (text only; angled header) ------------
+  p_w <- ggplot(df, aes(x = 1, y = ylab)) +
+    geom_text(aes(label = ifelse(weight >= 0.005, sprintf("%.2f", weight), "0")),
+              hjust = 0.5, size = 3) +
+    scale_x_continuous(position = "top", breaks = 1, labels = "Stacking\n weight",
+                       limits = c(0.5, 1.5), expand = expansion(0)) +
+    scale_y_discrete(expand = expansion(add = y_pad)) +
+    labs(x = NULL, y = NULL) +
+    base_theme +
+    theme(axis.text.y = element_blank(), axis.ticks = element_blank(),
+          axis.text.x.top = element_text(angle = 45, hjust = 0, vjust = 0, size = 9),
+          panel.grid = element_blank())
+
+  ## ---- right: covariate grid -------------------------------------------------
+  # Borders are grey GAPS (in data units) between an inset coloured tile and an
+  # oversized grey background tile. Oversizing the grey tile by the border width
+  # makes the outer/edge borders identical to the interior ones (fixes the skinny
+  # left/right edges). The fill is kept SQUARE by deriving the horizontal gap (gy)
+  # from the vertical gap (gx) and the cell aspect:
+  #   (1 - gx)*cell_w == (1 - gy)*cell_h   =>   gy = 1 - (1 - gx)/cell_aspect
+  gx <- v_border                                          # vertical border (frac of cell width)
+  gy <- max(0.02, min(0.92, 1 - (1 - gx) / cell_aspect))  # horizontal border (frac of cell height)
+
+  cov_cols <- g$cov_cols
+  cov_long <- df %>%
+    select(ylab, all_of(cov_cols)) %>%
+    pivot_longer(-ylab, names_to = "covariate", values_to = "present") %>%
+    mutate(row_idx = as.integer(ylab),
+           col_idx = as.integer(factor(covariate, levels = cov_cols)))
+
+  # Background tile carries the grid colour in "grid" style; in "lines" style it is
+  # white (invisible) so the grey grid disappears. Keeping the same oversized tile in
+  # both styles preserves the cell geometry, so `cell_aspect` (and square fills) carry
+  # over unchanged between the two versions.
+  bg_fill <- if (style == "grid") COL_GRID else "white"
+
+  p_cov <- ggplot(cov_long, aes(col_idx, row_idx)) +
+    geom_tile(width = 1 + gx, height = 1 + gy, fill = bg_fill, colour = NA) +
+    geom_tile(aes(fill = present), width = 1 - gx, height = 1 - gy, colour = NA)
+
+  if (style == "lines") {
+    # thin black vertical rules bounding every covariate column
+    vbreaks <- seq(0.5, length(cov_cols) + 0.5, by = 1)
+    p_cov <- p_cov +
+      annotate("segment", x = vbreaks, xend = vbreaks, y = 0.5, yend = nrow_c + 0.5,
+               colour = "black", linewidth = line_lwd)
+  }
+
+  p_cov <- p_cov +
+    scale_fill_manual(values = c(`TRUE` = FILL_COV, `FALSE` = FILL_EMPTY),
+                      guide = "none") +
+    scale_x_continuous(breaks = seq_along(cov_cols), labels = cov_cols,
+                       position = "top", expand = expansion(0)) +
+    scale_y_continuous(limits = c(1 - y_pad, nrow_c + y_pad),
+                       expand = expansion(0), oob = scales::oob_keep) +
+    labs(x = NULL, y = NULL) +
+    base_theme +
+    theme(axis.text.y = element_blank(), axis.ticks = element_blank(),
+          axis.text.x.top = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
+          panel.grid = element_blank(),
+          plot.margin = margin(4, 14, 4, 2))
+
+  ncov <- length(g$cov_cols)
+  p_forest + p_w + p_cov +
+    plot_layout(widths = grid::unit(
+      c(PANEL_FOREST_IN, PANEL_WEIGHT_IN, PANEL_CELL_IN * ncov), "in")) +
+    plot_annotation(
+      title = title,
+      theme = theme(plot.title  = element_text(face = "bold", size = 13),
+                    plot.margin = margin(4, 4, 2, 4)))
+}
+
+# Open a vector PDF device that renders the Δ / × glyphs. Prefer the macOS quartz
+# engine (always available here); fall back to cairo (Linux), then base pdf().
+open_pdf_device <- function(path, w, h) {
+  if (capabilities("aqua")) {
+    grDevices::quartz(file = path, type = "pdf", width = w, height = h, bg = "white")
+  } else if (capabilities("cairo")) {
+    grDevices::cairo_pdf(filename = path, width = w, height = h, bg = "white")
+  } else {
+    grDevices::pdf(file = path, width = w, height = h, bg = "white", encoding = "ISOLatin1")
+  }
+}
+
+# Save at a size that scales with the number of rows / covariate columns.
+# Writes a vector PDF and a 300-dpi LZW TIFF (no PNG).
+# `file` may carry any extension (e.g. ".png"); it is stripped and replaced.
+save_figure <- function(fig, file, n_rows, n_cov, x_value) {
+  # Width = panels (absolute) + fixed decoration, so forest & columns match across figures.
+  w <- PANEL_FOREST_IN + PANEL_WEIGHT_IN + PANEL_CELL_IN * n_cov + PANEL_DECOR_IN
+  h <- 1.9 + 0.30 * n_rows
+  base <- file.path(OUT_DIR, tools::file_path_sans_ext(file))
+  open_pdf_device(paste0(base, ".pdf"), w, h); print(fig); grDevices::dev.off()
+  ggsave(paste0(base, ".tiff"), fig, width = w, height = h, dpi = 300, device = "tiff",
+         bg = "white", limitsize = FALSE, compression = "lzw")
+  message("wrote ", base, ".{pdf,tiff}  (", round(w, 1), " x ", round(h, 1), " in)")
+}
+```
+
+
+## EDSM — K-fold
+
+```{r fig-edsm, fig.width=10, fig.height=8.5}
+fig_edsm <- make_comparison_figure(
+  g_edsm, title = "EDSM catch model comparison",
+  criterion_lab = "grouped K-fold CV on (1 | StationCode)",
+  cell_aspect = 1.40)   # calibrated to the saved figure size (cell height/width)
+fig_edsm
+save_figure(fig_edsm, "model_comparison_edsm_kfold.png",
+            n_rows = nrow(g_edsm$df), n_cov = length(g_edsm$cov_cols))
+```
+
+
+## TPS water quality — PSIS-LOO (moment matching)
+
+```{r fig-tps-wq, fig.width=10, fig.height=6.5}
+fig_wq <- make_comparison_figure(
+  g_wq, title = "TPS catch model comparison",
+  criterion_lab = "PSIS-LOO with moment matching",
+  cell_aspect = 1.51)   # calibrated to the saved figure size (cell height/width)
+fig_wq
+save_figure(fig_wq, "model_comparison_tps_wq_looic.png",
+            n_rows = nrow(g_wq$df), n_cov = length(g_wq$cov_cols))
+```
+
+
+## TPS fork length — K-fold
+
+```{r fig-tps-fl, fig.width=10, fig.height=7.5}
+fig_fl <- make_comparison_figure(
+  g_fl, title = "TPS fork length model comparison",
+  criterion_lab = "grouped K-fold CV on (1 | StationCode)",
+  cell_aspect = 1.43)   # calibrated to the saved figure size (cell height/width)
+fig_fl
+save_figure(fig_fl, "model_comparison_tps_fl_kfold.png",
+            n_rows = nrow(g_fl$df), n_cov = length(g_fl$cov_cols))
+```
+
+
+## TPS landscape — PSIS-LOO (moment matching)
+
+```{r fig-tps-landscape, fig.width=10, fig.height=5.5}
+fig_ls <- make_comparison_figure(
+  g_ls, title = "TPS landscape catch model comparison",
+  criterion_lab = "PSIS-LOO with moment matching",
+  cell_aspect = 1.63)   # calibrated to the saved figure size (cell height/width)
+fig_ls
+save_figure(fig_ls, "model_comparison_tps_landscape_looic.png",
+            n_rows = nrow(g_ls$df), n_cov = length(g_ls$cov_cols))
+```
+
+
+## Line-style variants (white fill, thin black column rules)
+
+Same data and layout as above, but the grey grid is hidden (white) and the covariate
+columns are separated by thin black vertical lines. The vertical cell border is shrunk
+(`v_border = 0.06`) so the square fills sit close to the rules; `cell_aspect` is unchanged
+(geometry is identical), so the fills stay square. Saved with a `_lines` suffix.
+
+```{r fig-edsm-lines, fig.width=10, fig.height=8.5}
+fig_edsm_lines <- make_comparison_figure(
+  g_edsm, title = "EDSM catch model comparison",
+  criterion_lab = "grouped K-fold CV on (1 | StationCode)",
+  cell_aspect = 1.40, v_border = 0.06, style = "lines")
+fig_edsm_lines
+save_figure(fig_edsm_lines, "model_comparison_edsm_kfold_lines.png",
+            n_rows = nrow(g_edsm$df), n_cov = length(g_edsm$cov_cols))
+```
+
+```{r fig-tps-wq-lines, fig.width=10, fig.height=6.5}
+fig_wq_lines <- make_comparison_figure(
+  g_wq, title = "TPS catch model comparison",
+  criterion_lab = "PSIS-LOO with moment matching",
+  cell_aspect = 1.51, v_border = 0.06, style = "lines")
+fig_wq_lines
+save_figure(fig_wq_lines, "model_comparison_tps_wq_looic_lines.png",
+            n_rows = nrow(g_wq$df), n_cov = length(g_wq$cov_cols))
+```
+
+```{r fig-tps-fl-lines, fig.width=10, fig.height=7.5}
+fig_fl_lines <- make_comparison_figure(
+  g_fl, title = "TPS fork length model comparison",
+  criterion_lab = "grouped K-fold CV on (1 | StationCode)",
+  cell_aspect = 1.43, v_border = 0.06, style = "lines")
+fig_fl_lines
+save_figure(fig_fl_lines, "model_comparison_tps_fl_kfold_lines.png",
+            n_rows = nrow(g_fl$df), n_cov = length(g_fl$cov_cols))
+```
+
+```{r fig-tps-landscape-lines, fig.width=10, fig.height=5.5}
+fig_ls_lines <- make_comparison_figure(
+  g_ls, title = "TPS landscape catch model comparison",
+  criterion_lab = "PSIS-LOO with moment matching",
+  cell_aspect = 1.63, v_border = 0.06, style = "lines")
+fig_ls_lines
+save_figure(fig_ls_lines, "model_comparison_tps_landscape_looic_lines.png",
+            n_rows = nrow(g_ls$df), n_cov = length(g_ls$cov_cols))
+```
