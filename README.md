@@ -42,6 +42,9 @@ also works.
   habitat_edge_maps.Rmd                  edge-type and water-body maps
   pub_table_tows_all.Rmd                 effort / catch summary table
 appendix_salinity_temperature_wateryear/ salinity, temperature & water-year appendix (own README)
+appendix_seasonal_smooth_sensitivity/    s(water-year day) basis-dimension sensitivity appendix
+  appendix_spline_sensitivity.R          refits TPS catch at k = 10, 6, 4, 3 (+ standardized) -> cache + figure
+  appendix_spline_sensitivity.Rmd        appendix text, tables and Fig. S1 from the cache
 R/
   source_rmd_chunks.R                    lets the appendix re-use main-text code by chunk label
 ```
